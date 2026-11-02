@@ -6,7 +6,9 @@ One decision per observation/segment and one event membership per observation
 are supported. Duplicate/conflicting inputs fail rather than selecting a winner.
 """
 
+import csv
 import json
+from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
@@ -78,8 +80,19 @@ def _table(frame, columns, keys):
 def read_reviews(path, columns):
     """Read text CSV without coercing IDs or treating source strings as NA."""
     try:
-        result = pd.read_csv(path, dtype=str, keep_default_na=False)
-    except (OSError, ValueError) as exc:
+        # pandas renames repeated headers (decision -> decision.1), hiding
+        # conflicting submitted fields from DataFrame duplicate checks.
+        with Path(path).open("r", encoding="utf-8-sig", newline="") as stream:
+            header = next(csv.reader(stream, strict=True), [])
+            if len(header) != len(set(header)):
+                raise PipelineError("Duplicate review CSV header")
+            if not set(columns).issubset(header):
+                raise PipelineError(
+                    f"Review columns required in original CSV header: {columns}"
+                )
+            stream.seek(0)
+            result = pd.read_csv(stream, dtype=str, keep_default_na=False)
+    except (OSError, ValueError, UnicodeError, csv.Error) as exc:
         raise PipelineError(f"Cannot read review CSV: {exc}") from exc
     keys = (
         ["observation_id", "road_segment_id"]

@@ -328,3 +328,52 @@ def test_positive_cannot_have_blank_source_provenance(no_review_case):
     case["observations"].loc[0, "source_id"] = ""
     with pytest.raises(PipelineError, match="source_id"):
         apply_reviews(**case)
+
+
+@pytest.mark.parametrize(
+    "table,columns",
+    [("match_reviews", MATCH_COLUMNS), ("event_reviews", EVENT_COLUMNS)],
+)
+def test_csv_rejects_conflicting_duplicate_decision_headers_before_labels(
+    tmp_path, no_review_case, table, columns
+):
+    import csv
+
+    case = reviewed(no_review_case)
+    row = case[table].iloc[0].to_dict()
+    headers = list(columns)
+    values = [row[column] for column in columns]
+    if "decision" not in headers:
+        headers.append("decision")
+        values.append("accepted")
+    headers.append("decision")
+    values.append("rejected")
+    path = tmp_path / f"{table}.csv"
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(headers)
+        writer.writerow(values)
+    # Parsing must fail before this review table can reach label generation.
+    with pytest.raises(PipelineError, match="Duplicate.*CSV.*header"):
+        read_reviews(path, columns)
+
+
+def test_csv_rejects_conflicting_duplicate_event_membership_header(tmp_path):
+    path = tmp_path / "event_reviews.csv"
+    path.write_text(
+        ",".join(EVENT_COLUMNS + ["event_group_id"])
+        + "\no1,event1,location1,page,human,2026-11-02T12:00:00Z,event2\n"
+    )
+    with pytest.raises(PipelineError, match="Duplicate.*CSV.*header"):
+        read_reviews(path, EVENT_COLUMNS)
+
+
+def test_csv_leading_blank_cannot_bypass_original_header_validation(tmp_path):
+    path = tmp_path / "reviews.csv"
+    path.write_text(
+        "\n"
+        + ",".join(MATCH_COLUMNS + ["decision"])
+        + "\no1,a,accepted,page,human,2026-11-02T12:00:00Z,rejected\n"
+    )
+    with pytest.raises(PipelineError):
+        read_reviews(path, MATCH_COLUMNS)

@@ -2,3 +2,6 @@ labeling:
   default_status: unknown
   positive_requires_review: true
   candidate_distance_m: 100
+  candidate_time_days: 1
+  # Day precision plus both thresholds creates only unconfirmed review edges.
+  # Year-only/missing-day observations remain singleton candidates; names do not merge.

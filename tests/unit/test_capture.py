@@ -1,0 +1,460 @@
+"""Offline reviewed-event evaluation; no source count or unknown label metrics."""
+
+import importlib.util
+import json
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import pytest
+from shapely.geometry import LineString
+
+from flood_ml.config import PipelineError
+from flood_ml.evaluation.capture import evaluate_capture, evaluation_gate
+from flood_ml.labeling.reviews import LINK_COLUMNS
+
+
+@pytest.fixture
+def capture_case():
+    ids = ["a", "b", "c", "d", "f", "r"]
+    lines = [
+        LineString([(0, 0), (10, 0)]),
+        LineString([(10, 0), (100, 0)]),
+        LineString([(0, 100), (100, 100)]),
+        LineString([(0, 200), (100, 200)]),
+        LineString([(0, 300), (9700, 300)]),
+        LineString([(0, 400), (100, 400)]),
+    ]
+    roads = gpd.GeoDataFrame({"road_segment_id": ids}, geometry=lines, crs=9210)
+    partitions = pd.DataFrame(
+        {
+            "road_segment_id": ids,
+            "block_id": ["H0", "H0", "H1", "H2", "H0", "R0"],
+            "partition": ["holdout"] * 5 + ["reference"],
+        }
+    )
+    scores = pd.DataFrame(
+        {
+            "road_segment_id": ids,
+            "score": [100.0, 0, 0, 0, 99, 0],
+            "elevation_median_m": [1.0, 0, 2, 3, 4, 0],
+            "mcda_eligible": [True] * 6,
+        }
+    )
+    rows = []
+    for group, n, segment_ids in [
+        ("ref", 20, ["r"]),
+        ("h0", 5, ["a", "b"]),
+        ("h1", 5, ["c"]),
+        ("h2", 10, ["d"]),
+    ]:
+        for i in range(n):
+            for segment_id in segment_ids:
+                event = f"{group}-{i}"
+                rows.append(
+                    {
+                        "event_group_id": event,
+                        "location_group_id": group,
+                        "road_segment_id": segment_id,
+                        "observation_id": event,
+                        "source_id": event,
+                        "evidence": "reviewed road extent",
+                        "reviewed_by": "human",
+                        "reviewed_at": "2026-11-02T12:00:00Z",
+                        "event_evidence": "reviewed place and time",
+                        "event_reviewed_by": "human",
+                        "event_reviewed_at": "2026-11-02T12:00:00Z",
+                        "affected_geometry": roads.set_index("road_segment_id").loc[
+                            segment_id, "geometry"
+                        ],
+                        "affected_geometry_reviewed": True,
+                        "affected_geometry_complete": True,
+                    }
+                )
+    return {
+        "scores": scores,
+        "roads": roads,
+        "confirmed_event_segments": pd.DataFrame(rows),
+        "partitions": partitions,
+        "config": {},
+    }
+
+
+def gate(case):
+    return evaluation_gate(case["confirmed_event_segments"], case["partitions"])
+
+
+def test_empty_review_reports_pending(capture_case):
+    empty = pd.DataFrame(columns=LINK_COLUMNS)
+    result = evaluation_gate(empty, capture_case["partitions"])
+    assert result["status"] == "pending_label_review"
+    assert result["missing_reference_events"] == 20
+    assert result["missing_holdout_events"] == 20
+    assert result["missing_holdout_blocks"] == 3
+    assert result["holdout_block_shortfalls"] == {"H0": 5, "H1": 5, "H2": 5}
+
+
+def test_gate_passes_distinct_reviewed_event_distribution(capture_case):
+    result = gate(capture_case)
+    assert result["status"] == "ready"
+    assert result["reference_events"] == result["holdout_events"] == 20
+    assert result["holdout_events_by_block"] == {"H0": 5, "H1": 5, "H2": 10}
+
+
+@pytest.mark.parametrize(
+    "partition, missing",
+    [("ref-19", "missing_reference_events"), ("h2-9", "missing_holdout_events")],
+)
+def test_event_quota_shortfalls(capture_case, partition, missing):
+    capture_case["confirmed_event_segments"] = capture_case[
+        "confirmed_event_segments"
+    ].loc[lambda x: x.event_group_id.ne(partition)]
+    result = gate(capture_case)
+    assert result["status"] == "pending_label_review"
+    assert result[missing] == 1
+
+
+def test_gate_cannot_reselect_blocks_or_count_sources(capture_case):
+    events = capture_case["confirmed_event_segments"]
+    events = pd.concat([events.loc[events.event_group_id.ne("h1-4")]] * 5)
+    result = evaluation_gate(events, capture_case["partitions"])
+    assert result["holdout_events"] == 19
+    assert result["holdout_block_shortfalls"]["H1"] == 1
+    assert result["missing_holdout_blocks"] == 1
+    capture_case["partitions"].loc[lambda x: x.block_id.eq("H1"), "block_id"] = "H0"
+    result = gate(capture_case)
+    assert result["holdout_events"] == 20
+    assert result["missing_holdout_blocks"] == 1
+    assert result["status"] == "pending_label_review"
+
+
+@pytest.mark.parametrize(
+    "shared", ["event_group_id", "location_group_id", "observation_id"]
+)
+def test_cross_partition_groups_are_excluded_and_audited(capture_case, shared):
+    events = capture_case["confirmed_event_segments"].copy()
+    events.loc[events.event_group_id.eq("h0-0"), shared] = events.loc[
+        events.event_group_id.eq("ref-0"), shared
+    ].iloc[0]
+    result = evaluation_gate(events, capture_case["partitions"])
+    assert result["status"] == "pending_label_review"
+    assert result["reference_events"] < 20
+    assert result["holdout_events"] < 20
+    assert "reviewed_group_crosses_partitions" in {
+        x["reason"] for x in result["excluded_events"]
+    }
+    assert capture_case["partitions"].partition.tolist() == ["holdout"] * 5 + [
+        "reference"
+    ]
+
+
+def test_missing_review_evidence_does_not_count(capture_case):
+    capture_case["confirmed_event_segments"]["event_reviewed_by"] = ""
+    result = gate(capture_case)
+    assert result["reference_events"] == result["holdout_events"] == 0
+
+
+def test_pending_returns_without_any_fabricated_metrics(capture_case):
+    capture_case["confirmed_event_segments"] = pd.DataFrame(columns=LINK_COLUMNS)
+    # Score geometry need not be consulted when review alone already fails.
+    capture_case["scores"] = pd.DataFrame()
+    result = evaluate_capture(**capture_case)
+    assert result["status"] == "pending_label_review"
+    assert result["gate"]["missing_reference_events"] == 20
+    assert result["evaluation_performed"] is False
+    assert not {"methods", "random", "bootstrap", "capture", "lift"}.intersection(
+        result
+    )
+    json.dumps(result, allow_nan=False)
+
+
+def test_length_capture_10_of_100_is_not_50_percent(capture_case):
+    result = evaluate_capture(**capture_case)
+    metric = result["methods"]["mcda"]["top_k"]["0.01"]
+    assert metric["capture"] == 0
+    assert metric["capture_any"] == 0.25
+    assert metric["capture_all"] == 0
+    assert metric["event_affected_fraction"]["h0-0"] == 0.1
+    assert result["eligible_event_count"] == 20
+    assert result["methods"]["elevation_only"]["top_k"]["0.01"]["capture"] == 0.25
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("b"), "score"] = 101
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("a"), "score"] = 0
+    result = evaluate_capture(**capture_case)
+    metric = result["methods"]["mcda"]["top_k"]["0.01"]
+    assert metric["capture"] == 0.25
+    assert metric["capture_all"] == 0
+    assert metric["event_affected_fraction"]["h0-0"] == 0.9
+
+
+def test_duplicates_and_union_geometry_do_not_inflate_denominator(capture_case):
+    original = evaluate_capture(**capture_case)
+    duplicate = capture_case["confirmed_event_segments"].copy()
+    duplicate["source_id"] = "another-news-link"
+    duplicate["observation_id"] += "-copy"
+    capture_case["confirmed_event_segments"] = pd.concat(
+        [duplicate, capture_case["confirmed_event_segments"]], ignore_index=True
+    )
+    result = evaluate_capture(**capture_case)
+    assert result == original
+    assert result["event_affected_length_m"]["h0-0"] == 100
+
+
+def test_ties_and_budget_overshoot_are_deterministic(capture_case):
+    capture_case["scores"]["score"] = 5.0
+    result = evaluate_capture(**capture_case)
+    metric = result["methods"]["mcda"]["top_k"]["0.01"]
+    assert metric["selected_road_segment_ids"] == ["a", "b"]
+    assert metric["actual_selected_fraction"] == 0.01
+    capture_case["scores"] = capture_case["scores"].iloc[::-1]
+    assert evaluate_capture(**capture_case) == result
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("f"), "score"] = 6
+    metric = evaluate_capture(**capture_case)["methods"]["mcda"]["top_k"]["0.01"]
+    assert metric["selected_length_m"] == 9700
+    assert metric["overshoot_m"] == 9600
+    assert metric["actual_selected_fraction"] == 0.97
+
+
+def test_all_methods_share_score_eligible_holdout_length(capture_case):
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("f"), "mcda_eligible"] = (
+        False
+    )
+    capture_case["roads"] = pd.concat(
+        [
+            capture_case["roads"],
+            gpd.GeoDataFrame(
+                {"road_segment_id": ["g"]},
+                geometry=[LineString([(0, 500), (100, 500)])],
+                crs=9210,
+            ),
+        ],
+        ignore_index=True,
+    )
+    capture_case["scores"] = pd.concat(
+        [
+            capture_case["scores"],
+            pd.DataFrame(
+                [
+                    {
+                        "road_segment_id": "g",
+                        "score": 100,
+                        "mcda_eligible": True,
+                        "elevation_median_m": np.nan,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    capture_case["partitions"] = pd.concat(
+        [
+            capture_case["partitions"],
+            pd.DataFrame(
+                [{"road_segment_id": "g", "block_id": "H1", "partition": "holdout"}]
+            ),
+        ],
+        ignore_index=True,
+    )
+    result = evaluate_capture(**capture_case)
+    assert result["eligible_road_segment_ids"] == ["a", "b", "c", "d"]
+    assert result["eligible_road_length_m"] == 300
+    for name in ["mcda", "elevation_only", "random"]:
+        assert result["methods"][name]["eligible_road_length_m"] == 300
+        assert set(result["methods"][name]["top_k"]) == {"0.01", "0.05", "0.1", "0.2"}
+    random = result["methods"]["random"]
+    assert random["seeds"] == list(range(42, 142))
+    assert len(random["runs"]) == 100
+    assert result["eligible_event_count"] == 20
+
+
+@pytest.mark.parametrize(
+    "column,value,reason",
+    [
+        ("affected_geometry_complete", False, "incomplete_affected_geometry"),
+        ("affected_geometry_reviewed", False, "unreviewed_affected_geometry"),
+        ("affected_geometry", None, "missing_affected_geometry"),
+    ],
+)
+def test_incomplete_affected_geometry_excluded(capture_case, column, value, reason):
+    links = capture_case["confirmed_event_segments"]
+    links.loc[links.event_group_id.eq("h0-0"), column] = value
+    result = evaluate_capture(**capture_case)
+    assert result["status"] == "pending_label_review"
+    assert result["gate"]["reviewed_holdout_events"] == 20
+    assert result["gate"]["holdout_events"] == 19
+    assert result["gate"]["missing_holdout_events"] == 1
+    assert "methods" not in result
+    assert result["exclusion_counts"][reason] == 1
+    assert result["excluded_affected_length_m"][reason] == (
+        None if value is None else 100
+    )
+
+
+def test_accepted_candidate_links_do_not_assert_complete_affected_geometry(
+    capture_case,
+):
+    capture_case["confirmed_event_segments"] = capture_case[
+        "confirmed_event_segments"
+    ].drop(columns=["affected_geometry_complete"])
+    result = evaluate_capture(**capture_case)
+    assert result["status"] == "pending_label_review"
+    assert result["gate"]["holdout_events"] == 0
+    assert result["exclusion_counts"]["incomplete_affected_geometry"] == 20
+    assert "methods" not in result
+
+
+def test_bootstrap_zero_denominators_remain_undefined(capture_case):
+    extra = (
+        capture_case["confirmed_event_segments"]
+        .loc[lambda x: x.event_group_id.str.startswith("h1")]
+        .copy()
+    )
+    extra["event_group_id"] = extra.event_group_id.str.replace("h1", "h3")
+    extra["observation_id"] = extra.event_group_id
+    extra["location_group_id"] = "h3"
+    extra["road_segment_id"] = "f"
+    extra["affected_geometry"] = (
+        capture_case["roads"].set_index("road_segment_id").loc["f", "geometry"]
+    )
+    capture_case["partitions"].loc[lambda x: x.road_segment_id.eq("f"), "block_id"] = (
+        "H3"
+    )
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("f"), "mcda_eligible"] = (
+        False
+    )
+    capture_case["confirmed_event_segments"] = pd.concat(
+        [capture_case["confirmed_event_segments"], extra], ignore_index=True
+    )
+    result = evaluate_capture(**capture_case)
+    ci = result["methods"]["mcda"]["top_k"]["0.01"]["uncertainty"]
+    assert ci["replicates"] == 1000
+    assert 0 < ci["undefined_replicates"] < 1000
+    assert ci["valid_replicates"] + ci["undefined_replicates"] == 1000
+    assert ci["capture_ci95"] is not None
+    assert ci["undefined_lift_replicates"] >= ci["undefined_replicates"]
+    assert result["exploratory"] is True
+    assert "source" in result["limitations"].lower()
+    json.dumps(result, allow_nan=False)
+
+
+def test_geometry_outside_confirmed_segment_is_not_evaluated(capture_case):
+    links = capture_case["confirmed_event_segments"]
+    links.loc[links.event_group_id.eq("h0-0"), "affected_geometry"] = LineString(
+        [(0, 0), (200, 0)]
+    )
+    result = evaluate_capture(**capture_case)
+    assert result["exclusion_counts"]["affected_geometry_outside_confirmed_road"] == 1
+
+
+def test_invalid_partitions_or_duplicate_scores_fail(capture_case):
+    bad = capture_case["partitions"].copy()
+    bad.loc[0, "partition"] = "train"
+    with pytest.raises(PipelineError):
+        evaluation_gate(capture_case["confirmed_event_segments"], bad)
+    capture_case["scores"] = pd.concat([capture_case["scores"]] * 2)
+    with pytest.raises(PipelineError):
+        evaluate_capture(**capture_case)
+
+
+def test_review_output_wkb_hex_geometry_is_supported(capture_case):
+    original = evaluate_capture(**capture_case)
+    capture_case["confirmed_event_segments"]["affected_geometry"] = capture_case[
+        "confirmed_event_segments"
+    ].affected_geometry.map(lambda geom: geom.wkb_hex)
+    assert evaluate_capture(**capture_case) == original
+
+
+def test_zero_score_coverage_keeps_metrics_undefined(capture_case):
+    capture_case["scores"]["mcda_eligible"] = False
+    result = evaluate_capture(**capture_case)
+    assert result["eligible_road_length_m"] == 0
+    assert result["eligible_event_count"] == 0
+    assert result["status"] == "pending_label_review"
+    assert result["gate"]["missing_reference_events"] == 20
+    assert result["gate"]["missing_holdout_events"] == 20
+    assert "methods" not in result
+
+
+def test_score_coverage_shortfall_cannot_pass_review_quota(capture_case):
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("c"), "mcda_eligible"] = (
+        False
+    )
+    result = evaluate_capture(**capture_case)
+    assert result["status"] == "pending_label_review"
+    assert result["review_geometry_gate"]["status"] == "ready"
+    assert result["gate"]["holdout_events"] == 15
+    assert result["gate"]["missing_holdout_events"] == 5
+    assert result["gate"]["missing_holdout_blocks"] == 1
+    assert result["exclusion_counts"]["affected_geometry_outside_score_coverage"] == 5
+    assert (
+        result["excluded_affected_length_m"]["affected_geometry_outside_score_coverage"]
+        == 500
+    )
+    assert "methods" not in result
+
+
+def test_evaluation_rules_cannot_relax_the_data_gate(capture_case):
+    capture_case["config"] = {"evaluation": {"minimum_holdout_events": 1}}
+    with pytest.raises(PipelineError, match="predeclared"):
+        evaluate_capture(**capture_case)
+
+
+def load_cli():
+    path = Path(__file__).resolve().parents[2] / "scripts/evaluate.py"
+    spec = importlib.util.spec_from_file_location("evaluate_cli", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cli_atomically_writes_real_empty_review_pending(tmp_path, capture_case):
+    root = Path(__file__).resolve().parents[2]
+    scores = tmp_path / "scores.parquet"
+    roads = tmp_path / "roads.parquet"
+    events = tmp_path / "events.parquet"
+    partitions = tmp_path / "partitions.parquet"
+    output = tmp_path / "evaluation.json"
+    capture_case["scores"].to_parquet(scores)
+    capture_case["roads"].to_parquet(roads)
+    pd.DataFrame(columns=LINK_COLUMNS).to_parquet(events)
+    capture_case["partitions"].to_parquet(partitions)
+    arguments = [
+        "--repo-root",
+        str(root),
+        "--scores",
+        str(scores),
+        "--roads",
+        str(roads),
+        "--confirmed-event-segments",
+        str(events),
+        "--partitions",
+        str(partitions),
+        "--output",
+        str(output),
+    ]
+    cli = load_cli()
+    # Repo-relative paths are required; use the isolated tmp directory as repo.
+    import shutil
+
+    shutil.copytree(root / "configs", tmp_path / "configs")
+    arguments[1] = str(tmp_path)
+    for i, value in enumerate(arguments):
+        if value in map(str, [scores, roads, events, partitions, output]):
+            arguments[i] = Path(value).name
+    assert cli.main(arguments) == 0
+    result = json.loads(output.read_text())
+    assert result["status"] == "pending_label_review"
+    assert result["gate"]["missing_reference_events"] == 20
+    assert result["gate"]["missing_holdout_events"] == 20
+    assert result["input_hashes"].keys() == {
+        "scores",
+        "roads",
+        "confirmed_event_segments",
+        "partitions",
+    }
+    assert not {"methods", "bootstrap", "random"}.intersection(result)
+    assert list(tmp_path.glob("*.tmp")) == []
+    before = scores.read_bytes()
+    arguments[-1] = "scores.parquet"
+    assert cli.main(arguments) == 1
+    assert scores.read_bytes() == before

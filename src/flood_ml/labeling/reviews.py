@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 
 from flood_ml.config import PipelineError
@@ -32,6 +33,10 @@ EVENT_COLUMNS = [
     "reviewed_by",
     "reviewed_at",
 ]
+# Optional for legacy review files. Missing/blank is false; never inferred from
+# an accepted match. True explicitly attests that the accepted FULL road segment
+# set is this event's complete affected extent, reviewed using the evidence.
+EVENT_TEMPLATE_COLUMNS = [*EVENT_COLUMNS, "affected_geometry_complete"]
 LINK_COLUMNS = [
     "observation_id",
     "source_id",
@@ -46,6 +51,9 @@ LINK_COLUMNS = [
     "event_reviewed_at",
     "match_distance_m",
     "match_method",
+    "affected_geometry_complete",
+    "affected_geometry_reviewed",
+    "affected_geometry",
 ]
 
 
@@ -74,6 +82,24 @@ def _table(frame, columns, keys):
             raise PipelineError(
                 "Invalid reviewed_at; timestamp with timezone required"
             ) from exc
+    if "decision" not in columns:
+        field = "affected_geometry_complete"
+        submitted = result.get(field, pd.Series(False, index=result.index))
+
+        def explicit_boolean(value):
+            if isinstance(value, (bool, np.bool_)):
+                return bool(value)
+            if isinstance(value, str) and value in ("true", "false", ""):
+                return value == "true"
+            raise PipelineError(
+                "affected_geometry_complete must be explicit true/false or blank"
+            )
+
+        result[field] = submitted.map(explicit_boolean).astype(bool)
+        if result.groupby("event_group_id")[field].nunique().gt(1).any():
+            raise PipelineError(
+                "Inconsistent affected_geometry_complete within event_group_id"
+            )
     return result
 
 
@@ -131,6 +157,7 @@ def apply_reviews(
             "Unsupported review decision; verified_negative requires independent data"
         )
     obs = observations.set_index("observation_id")
+    road_geometry = roads.set_index("road_segment_id").geometry
     road_ids = set(roads.road_segment_id)
     for frame in [candidates, mr, er]:
         if "observation_id" not in frame or not set(frame.observation_id).issubset(
@@ -185,6 +212,14 @@ def apply_reviews(
                 "event_reviewed_at": event.reviewed_at,
                 "match_distance_m": candidate.match_distance_m,
                 "match_method": candidate.match_method,
+                "affected_geometry_complete": bool(event.affected_geometry_complete),
+                "affected_geometry_reviewed": bool(event.affected_geometry_complete),
+                # Hex WKB stays JSON/Parquet-safe without misdeclaring ordinary
+                # Parquet as GeoParquet. Only a human's explicit completeness
+                # assertion enables this full-segment extent, never candidates.
+                "affected_geometry": road_geometry.loc[review.road_segment_id].wkb_hex
+                if event.affected_geometry_complete
+                else None,
             }
         )
     confirmed = pd.DataFrame(links, columns=LINK_COLUMNS)

@@ -247,6 +247,54 @@ def test_review_of_nonexistent_pair_fails(no_review_case):
         apply_reviews(**case)
 
 
+@pytest.mark.parametrize(
+    "submitted, expected",
+    [("true", True), ("false", False), ("", False), (None, False)],
+)
+def test_event_extent_completeness_requires_explicit_human_assertion(
+    tmp_path, no_review_case, submitted, expected
+):
+    from shapely import from_wkb
+
+    case = reviewed(no_review_case)
+    if submitted is not None:
+        case["event_reviews"]["affected_geometry_complete"] = submitted
+    path = tmp_path / "event_reviews.csv"
+    case["event_reviews"].to_csv(path, index=False)
+    case["event_reviews"] = read_reviews(path, EVENT_COLUMNS)
+    assert case["event_reviews"].affected_geometry_complete.tolist() == [expected]
+    _, links = apply_reviews(**case)
+    assert links.affected_geometry_complete.tolist() == [expected]
+    assert links.affected_geometry_reviewed.tolist() == [expected]
+    if expected:
+        assert from_wkb(links.affected_geometry.iloc[0]).equals(
+            case["roads"].geometry.iloc[0]
+        )
+    else:
+        assert links.affected_geometry.isna().all()
+
+
+@pytest.mark.parametrize("submitted", ["yes", "1", "TRUE", 1])
+def test_completeness_rejects_ambiguous_nonboolean_assertion(no_review_case, submitted):
+    case = reviewed(no_review_case)
+    case["event_reviews"]["affected_geometry_complete"] = submitted
+    with pytest.raises(PipelineError, match="affected_geometry_complete"):
+        apply_reviews(**case)
+
+
+def test_completeness_must_be_consistent_within_event(no_review_case):
+    case = reviewed(no_review_case)
+    row = (
+        case["event_reviews"]
+        .copy()
+        .assign(observation_id="o2", affected_geometry_complete=True)
+    )
+    case["event_reviews"]["affected_geometry_complete"] = False
+    case["event_reviews"] = pd.concat([case["event_reviews"], row], ignore_index=True)
+    with pytest.raises(PipelineError, match="Inconsistent affected_geometry_complete"):
+        apply_reviews(**case)
+
+
 @pytest.mark.parametrize("radius", [-1, True, float("nan"), "100"])
 def test_invalid_radius_fails(no_review_case, radius):
     with pytest.raises(PipelineError):

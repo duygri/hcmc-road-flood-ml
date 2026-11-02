@@ -14,6 +14,21 @@ experiments:
   spatial_block_m: 5000
   holdout_fraction: 0.2
   guard_m: 1000
+  evaluation:
+    # Independent reviewed events, never source records; frozen blocks stay fixed.
+    minimum_reference_events: 20
+    minimum_holdout_events: 20
+    minimum_holdout_blocks: 3
+    minimum_events_per_holdout_block: 5
+    top_k_length_fractions: [0.01, 0.05, 0.1, 0.2]
+    primary_capture_fraction: 0.5
+    sensitivity_capture: [any, 1.0]
+    # Human-reviewed complete affected geometry and full common score coverage.
+    minimum_affected_score_coverage: 1.0
+    random_seed_start: 42
+    random_repetitions: 100
+    bootstrap_seed: 42
+    bootstrap_repetitions: 1000
   mcda:
     # Predeclared hypothesis; no fitting or selection against flood labels.
     feature_spec:

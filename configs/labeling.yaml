@@ -5,3 +5,6 @@ labeling:
   candidate_time_days: 1
   # Day precision plus both thresholds creates only unconfirmed review edges.
   # Year-only/missing-day observations remain singleton candidates; names do not merge.
+  # Search radius generates candidates only; it is not location accuracy.
+  match_reviews_template: configs/local/review_decisions.csv
+  event_reviews_template: configs/local/event_reviews.csv

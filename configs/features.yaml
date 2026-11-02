@@ -3,4 +3,11 @@ features:
   neighborhood_radius_m: 500
   landcover_buffer_m: 250
   water_buffer_m: 250
-  # Individual feature methods and source bindings are implemented in later tasks.
+  min_valid_fraction: 0.9
+  # EPSG:9210 snapped grids: DEM bilinear at 30 m; WorldCover nearest at 10 m.
+  # Horn 3x3 needs sqrt(2)*30 m support (study_area.context.raster_stencil_m).
+  # Sampling uses pixel centres; each feature carries its own valid fraction.
+  # Relative-height fraction is min(local fraction, neighbourhood fraction).
+  # Trees, shrubs, grassland, cropland, wetlands, mangroves, moss/lichen.
+  # WorldCover codes: 10,20,30,40,90,95,100; built-up: 50; nodata: source mask.
+  vertical_datum: FABDEM native vertical reference; not independently verified

@@ -9,7 +9,7 @@ from datetime import date
 
 import geopandas as gpd
 from shapely import prepare
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
 from flood_ml.config import PipelineError
@@ -98,6 +98,48 @@ def _lines(geometry):
             yield from _lines(part)
 
 
+def _clip_traversal(chain, polygon):
+    """Clip single source edges and join only consecutive source intervals.
+
+    Whole-LineString intersection nodes self-crossings and dissolves retraced
+    portions. Each edge has no such ambiguity. Source chainage distinguishes
+    genuine consecutive fragments from a later return to the same coordinate.
+    The caller canonicalizes source direction before geometric calculations,
+    so reversing the source cannot introduce different clipping roundoff.
+    """
+    if polygon.covers(chain):
+        yield chain
+        return
+    pending = []
+    previous_end = None
+    traversed = 0.0
+    for start, end in itertools.pairwise(chain.coords):
+        edge = LineString([start, end])
+        if edge.length == 0:
+            continue
+        fragments = []
+        for part in _lines(edge.intersection(polygon)):
+            coords = list(part.coords)
+            lo = edge.project(Point(coords[0]))
+            hi = edge.project(Point(coords[-1]))
+            if lo > hi:
+                lo, hi = hi, lo
+                coords.reverse()
+            fragments.append((lo, hi, coords))
+        for lo, hi, coords in sorted(fragments):
+            source_start, source_end = traversed + lo, traversed + hi
+            if pending and previous_end == source_start and pending[-1] == coords[0]:
+                pending.extend(coords[1:])
+            else:
+                if pending:
+                    yield LineString(pending)
+                pending = coords
+            previous_end = source_end
+        traversed += edge.length
+    if pending:
+        yield LineString(pending)
+
+
 def segment_roads(
     ways: gpd.GeoDataFrame,
     aoi: gpd.GeoDataFrame,
@@ -110,7 +152,9 @@ def segment_roads(
 
     Length and chainage use unrounded projected geometry. Each clipped topology
     chain gets ceil(length/target_m) equal pieces; target <= maximum is required.
-    Short chains/fragments survive. Node refs/tags retain the *whole source way*.
+    Boundary clipping preserves source edge traversal; geometric self-crossings
+    never introduce junctions. Short chains/fragments survive. Node refs/tags
+    retain the *whole source way*.
     Chainage starts at zero on each clipped, canonically oriented chain.
 
     IDs are SHA-256 of snapshot, source way ID, canonical chain coordinate
@@ -146,7 +190,7 @@ def segment_roads(
         raise PipelineError("OSM way IDs must be nonnull and unique")
     config_digest = _hash(
         {
-            "version": 1,
+            "version": 2,
             "precision": CANONICAL_DECIMALS,
             "crs": aoi.crs.to_string(),
             "target_m": float(target_m),
@@ -193,17 +237,10 @@ def segment_roads(
             + [len(coords) - 1]
         )
         for start, end in itertools.pairwise(cuts):
-            topology_chain = LineString(coords[start : end + 1])
+            topology_chain = _canonical(LineString(coords[start : end + 1]))
             if not polygon.intersects(topology_chain):
                 continue
-            # Interior chains already satisfy exact clipping. Apart from being
-            # faster, retaining them avoids GEOS noding a self-crossing way.
-            clipped_geometry = (
-                topology_chain
-                if polygon.covers(topology_chain)
-                else topology_chain.intersection(polygon)
-            )
-            for clipped in _lines(clipped_geometry):
+            for clipped in _clip_traversal(topology_chain, polygon):
                 chain = _canonical(clipped)
                 chain_key = _coordinates(chain)
                 chain_id = _hash(

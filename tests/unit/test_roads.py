@@ -1,13 +1,14 @@
 """Node topology, metric clipping, provenance and deterministic road IDs."""
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
 
 import geopandas as gpd
 import pytest
-from shapely.geometry import LineString, Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 from flood_ml.config import PipelineError
 from flood_ml.gis.roads import segment_roads
@@ -145,6 +146,59 @@ def test_clip_uses_concave_polygon_and_keeps_disjoint_fragments(ways_case, aoi):
     result = segment(ways_case.loc[ways_case.osm_way_id == "40"], aoi)
     assert result.length_m.sum() == pytest.approx(800, abs=1e-6)
     assert result.geometry.difference(aoi.geometry.iloc[0]).length.max() < 1e-6
+
+
+def test_boundary_clip_preserves_self_crossing_source_traversal_and_reversed_ids(aoi):
+    aoi.geometry = [box(0, 0, 100, 100)]
+    ways = gpd.GeoDataFrame(
+        {
+            "osm_way_id": ["crossing"],
+            "node_ids": [[1, 2, 3, 4]],
+            "highway_type": ["road"],
+        },
+        geometry=[LineString([(-10, 10), (90, 90), (10, 90), (90, 10)])],
+        crs=9210,
+    )
+    result = segment(ways, aoi)
+    assert result.chain_id.nunique() == 1
+    assert len(result) == 3
+    expected_length = math.hypot(90, 72) + 80 + math.hypot(80, 80)
+    assert result.length_m.sum() == pytest.approx(expected_length, abs=1e-6)
+    assert result.length_m.tolist() == pytest.approx(
+        [expected_length / 3] * 3, abs=1e-6
+    )
+    false_junction = Point(410 / 9, 490 / 9)
+    for line in result.geometry:
+        assert Point(line.coords[0]).distance(false_junction) > 1e-6
+        assert Point(line.coords[-1]).distance(false_junction) > 1e-6
+    assert result.geometry.difference(aoi.geometry.iloc[0]).length.max() <= 1e-6
+    ways.geometry = ways.geometry.map(lambda line: LineString(list(line.coords)[::-1]))
+    ways["node_ids"] = [[4, 3, 2, 1]]
+    reversed_result = segment(ways, aoi)
+    assert reversed_result.road_segment_id.tolist() == result.road_segment_id.tolist()
+    assert (
+        reversed_result.geometry.to_wkb().tolist() == result.geometry.to_wkb().tolist()
+    )
+
+
+def test_clip_keeps_separate_traversals_after_outside_excursion_to_same_boundary_point(
+    aoi,
+):
+    aoi.geometry = [box(0, 0, 100, 100)]
+    ways = gpd.GeoDataFrame(
+        {
+            "osm_way_id": ["excursion"],
+            "node_ids": [[1, 2, 3, 4, 5, 6]],
+            "highway_type": ["road"],
+        },
+        geometry=[
+            LineString([(10, 50), (100, 50), (120, 50), (100, 50), (100, 90), (10, 90)])
+        ],
+        crs=9210,
+    )
+    result = segment(ways, aoi)
+    assert result.chain_id.nunique() == 2
+    assert sorted(result.length_m) == pytest.approx([90, 130], abs=1e-6)
 
 
 @pytest.mark.parametrize(

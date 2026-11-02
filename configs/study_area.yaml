@@ -12,3 +12,23 @@ study_area:
     raster_stencil_m: 42.42640687119285
   segment_target_m: 150
   segment_max_m: 200
+  roads:
+    allowed_highways:
+    - motorway
+    - trunk
+    - primary
+    - secondary
+    - tertiary
+    - motorway_link
+    - trunk_link
+    - primary_link
+    - secondary_link
+    - tertiary_link
+    - residential
+    - unclassified
+    - living_street
+    - service
+    - road
+    # Kept in road outputs; downstream MCDA must exclude structures because
+    # the DEM does not describe the road surface of a bridge or tunnel.
+    score_bridge_tunnel: false

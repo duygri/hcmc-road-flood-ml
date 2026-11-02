@@ -20,7 +20,12 @@ from flood_ml.baseline.mcda import (
     fit_normalizer,
     score_mcda,
 )
-from flood_ml.config import PipelineError, load_settings, resolve_output
+from flood_ml.config import (
+    PipelineError,
+    _validate_run_id,
+    load_settings,
+    resolve_output,
+)
 from flood_ml.gis.study_area import require_metric_crs
 from flood_ml.labeling.matching import require_ids
 from flood_ml.utils.run import (
@@ -74,6 +79,47 @@ def _parquet_atomic(frame, path):
             temporary.unlink(missing_ok=True)
 
 
+def _preflight_publications(settings, run_id, inputs):
+    """Resolve and protect every caller input before creating any run files.
+
+    resolve_output canonicalizes symlinks/junctions; samefile also recognizes
+    existing hard links whose canonical path strings differ. The manifest,
+    started/failed QC and initialization lock are publications too.
+    """
+    _validate_run_id(run_id)
+    directories = {
+        name: resolve_output(settings.repo_root, f"{base}/{run_id}")
+        for name, base in settings.experiments["outputs"].items()
+    }
+    publications = {
+        "scores": directories["processed"] / "road_susceptibility.parquet",
+        "sensitivity_scores": directories["processed"] / "sensitivity_scores.parquet",
+        "normalizer": directories["artifacts"] / "normalizer.json",
+        "rules": directories["artifacts"] / "mcda_rules.json",
+        "sensitivity": directories["reports"] / "weight_sensitivity.json",
+        "qc": directories["reports"] / "baseline_qc.json",
+        "run": directories["reports"] / "run.json",
+        "lock": directories["reports"] / ".start.lock",
+    }
+    publications = {
+        name: resolve_output(
+            settings.repo_root, str(path.relative_to(settings.repo_root))
+        )
+        for name, path in publications.items()
+    }
+    for name, source in inputs.items():
+        for destination in [*publications.values(), *directories.values()]:
+            if source == destination or (
+                source.exists()
+                and destination.exists()
+                and source.samefile(destination)
+            ):
+                raise PipelineError(
+                    f"Input {name} aliases publication destination {destination}"
+                )
+    return publications
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/experiments.yaml"))
@@ -106,18 +152,20 @@ def main(argv=None):
             name: resolve_output(settings.repo_root, value)
             for name, value in inputs.items()
         }
+        run_id = args.run_id or settings.experiments["run_id"]
+        publications = _preflight_publications(settings, run_id, paths)
         hashes = {name: _hash_file(path) for name, path in paths.items()}
         settings = replace(
             settings,
             experiments={
                 **settings.experiments,
-                "run_id": args.run_id or settings.experiments["run_id"],
+                "run_id": run_id,
                 "baseline_inputs": inputs,
                 "baseline_input_hashes": hashes,
             },
         )
         run = start_run(settings, settings.experiments["run_id"])
-        qc_path = run.reports_dir / "baseline_qc.json"
+        qc_path = publications["qc"]
         write_json_atomic(qc_path, {"status": "started", "run_id": run.run_id})
         features = pd.read_parquet(paths["features"])
         partitions = pd.read_parquet(paths["partitions"])
@@ -206,11 +254,14 @@ def main(argv=None):
             ignore_index=True,
         )
         outputs = [
-            run.processed_dir / "road_susceptibility.parquet",
-            run.processed_dir / "sensitivity_scores.parquet",
-            run.artifacts_dir / "normalizer.json",
-            run.artifacts_dir / "mcda_rules.json",
-            run.reports_dir / "weight_sensitivity.json",
+            publications[name]
+            for name in (
+                "scores",
+                "sensitivity_scores",
+                "normalizer",
+                "rules",
+                "sensitivity",
+            )
         ]
         _parquet_atomic(primary, outputs[0])
         _parquet_atomic(all_scores, outputs[1])
@@ -269,7 +320,7 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         if run is not None:
             write_json_atomic(
-                run.reports_dir / "baseline_qc.json",
+                publications["qc"],
                 {"status": "failed", "error": str(exc)},
             )
         print(f"Baseline failed: {exc}", file=sys.stderr)

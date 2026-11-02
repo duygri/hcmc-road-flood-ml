@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -314,3 +315,89 @@ def test_empty_scoring_retains_schema_and_empty_sensitivity(normalizer):
     assert sensitivity["eligible_count"] == 0
     assert sensitivity["eligible_length_m"] == 0
     assert sensitivity["schemes"]["equal"]["top_k"]["0.1"]["selected_length_m"] == 0
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "data/processed/collision/road_susceptibility.parquet",
+        "data/processed/collision/sensitivity_scores.parquet",
+        "artifacts/collision/normalizer.json",
+        "artifacts/collision/mcda_rules.json",
+        "reports/runs/collision/weight_sensitivity.json",
+        "reports/runs/collision/baseline_qc.json",
+        "reports/runs/collision/run.json",
+        "reports/runs/collision/.start.lock",
+    ],
+)
+@pytest.mark.parametrize("input_name", ["features", "partitions", "roads"])
+def test_cli_rejects_input_destination_collision_before_any_write(
+    tmp_path, destination, input_name
+):
+    _assert_collision_untouched(tmp_path, destination, input_name)
+
+
+def test_cli_rejects_hardlink_alias_before_any_write(tmp_path):
+    _assert_collision_untouched(
+        tmp_path, "reports/runs/collision/baseline_qc.json", "partitions", hardlink=True
+    )
+
+
+def _assert_collision_untouched(tmp_path, destination, input_name, *, hardlink=False):
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    root = Path(__file__).parents[2]
+    (tmp_path / "configs").mkdir()
+    for name in ["sources", "features", "experiments", "labeling", "study_area"]:
+        doc = yaml.safe_load((root / f"configs/{name}.yaml").read_text())
+        if name == "sources":
+            doc["sources"]["assets"] = []
+        (tmp_path / f"configs/{name}.yaml").write_text(yaml.safe_dump(doc))
+    (tmp_path / "uv.lock").write_bytes(b"fixture lock")
+    target = tmp_path / destination
+    target.parent.mkdir(parents=True, exist_ok=True)
+    paths = {
+        name: tmp_path / f"{name}.parquet"
+        for name in ["features", "partitions", "roads"]
+    }
+    paths[input_name] = target
+    roads().to_parquet(paths["features"])
+    pd.DataFrame(
+        {"road_segment_id": ["r0", "r1"], "partition": ["reference", "reference"]}
+    ).to_parquet(paths["partitions"])
+    gpd.GeoDataFrame(
+        {"road_segment_id": ["r0", "r1"]},
+        geometry=[LineString([(0, 0), (100, 0)]), LineString([(0, 1), (100, 1)])],
+        crs=9210,
+    ).to_parquet(paths["roads"])
+    if hardlink:
+        alias = tmp_path / "alias.parquet"
+        os.link(target, alias)
+        paths[input_name] = alias
+    before = {
+        str(p.relative_to(tmp_path)): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+    command = [
+        sys.executable,
+        str(root / "scripts/run_baseline.py"),
+        "--repo-root",
+        str(tmp_path),
+        "--run-id",
+        "collision",
+    ]
+    for name, path in paths.items():
+        command.extend([f"--{name}", str(path.relative_to(tmp_path))])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    after = {
+        str(p.relative_to(tmp_path)): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+    assert after == before, (
+        "Rejected collision changed inputs or created publication/provenance files"
+    )
+    assert result.returncode != 0
+    assert "aliases publication destination" in result.stderr

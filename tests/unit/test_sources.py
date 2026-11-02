@@ -140,9 +140,8 @@ def test_empty_inventory_cannot_report_success(configured_sources):
     assert json.loads(audit_path(settings).read_text())["status"] == "FAIL"
 
 
-def test_cli_validates_and_only_refreshes_on_explicit_flag(
-    configured_sources, monkeypatch, capsys
-):
+@pytest.fixture
+def configured_cli(configured_sources, monkeypatch):
     import importlib.util
     from pathlib import Path
 
@@ -178,6 +177,14 @@ def test_cli_validates_and_only_refreshes_on_explicit_flag(
             yaml.safe_dump({name: section}), encoding="utf-8"
         )
     (root / "uv.lock").write_bytes(b"test lock")
+    return module
+
+
+def test_cli_validates_and_only_refreshes_on_explicit_flag(
+    configured_sources, configured_cli, capsys
+):
+    module = configured_cli
+    root = configured_sources.repo_root
     assert module.main(["--config", "configs/sources.yaml"]) == 0
     assert "PASS D03/tile_1" in capsys.readouterr().out
     (root / "inputs/abc.bin").write_bytes(b"abd")
@@ -203,3 +210,30 @@ def test_cli_validates_and_only_refreshes_on_explicit_flag(
     (root / "inputs/abc.bin").write_bytes(b"bad")
     assert module.main(["--run-id", "../invalid", "--refresh-manifest"]) == 1
     assert (root / "manifest.yaml").read_bytes() == before_invalid
+
+
+@pytest.mark.parametrize("status", ["FAIL_MISSING", "FAIL_UNREADABLE"])
+def test_refresh_missing_source_persists_failed_audit(
+    configured_sources, configured_cli, status
+):
+    root = configured_sources.repo_root
+    (root / "inputs/abc.bin").unlink()
+    if status == "FAIL_UNREADABLE":
+        (root / "inputs/abc.bin").mkdir()
+    original = (root / "manifest.yaml").read_bytes()
+    assert configured_cli.main(["--refresh-manifest"]) == 1
+    assert (root / "manifest.yaml").read_bytes() == original
+    audit = json.loads(audit_path(configured_sources).read_text(encoding="utf-8"))
+    assert audit["status"] == "FAIL"
+    assert audit["assets"][0]["status"] == status
+
+
+def test_refresh_unusable_audit_destination_preserves_manifest(
+    configured_sources, configured_cli
+):
+    root = configured_sources.repo_root
+    (root / "inputs/abc.bin").write_bytes(b"abd")
+    (root / "reports").write_bytes(b"blocks audit directory")
+    original = (root / "manifest.yaml").read_bytes()
+    assert configured_cli.main(["--refresh-manifest"]) == 1
+    assert (root / "manifest.yaml").read_bytes() == original

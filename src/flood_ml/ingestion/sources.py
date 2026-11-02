@@ -137,8 +137,8 @@ def _audit_path(settings: Settings) -> Path:
     return path
 
 
-def validate_sources(settings: Settings) -> pd.DataFrame:
-    """Audit every asset, persist PASS/FAIL, then raise on any failed integrity.
+def _audit_sources(settings: Settings) -> pd.DataFrame:
+    """Persist all integrity results before returning, including failed rows.
 
     Audit bytes are observed bytes, with null size/hash for missing/unreadable
     files. Size mismatches take precedence over SHA mismatches. Structural errors
@@ -192,9 +192,15 @@ def validate_sources(settings: Settings) -> pd.DataFrame:
     write_json_atomic(
         audit_path, {"status": "FAIL" if failed else "PASS", "assets": rows}
     )
-    if failed:
-        raise PipelineError(f"Source integrity failed; inspect {audit_path}")
     return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def validate_sources(settings: Settings) -> pd.DataFrame:
+    """Persist every result, then reject any failed source integrity check."""
+    audit = _audit_sources(settings)
+    if (audit["status"] != "PASS").any():
+        raise PipelineError(f"Source integrity failed; inspect {_audit_path(settings)}")
+    return audit
 
 
 def build_manifest(settings: Settings) -> dict:

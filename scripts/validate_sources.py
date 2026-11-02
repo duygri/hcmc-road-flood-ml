@@ -17,11 +17,16 @@ from flood_ml.config import (
     resolve_input,
     resolve_output,
 )
-from flood_ml.ingestion.sources import build_manifest, validate_sources
+from flood_ml.ingestion.sources import _audit_sources, build_manifest, validate_sources
 from flood_ml.utils.run import start_run
 
 
 def _refresh(settings):
+    # Persist observed bytes/hashes first. This both records missing/unreadable
+    # failures and proves the audit destination accepts an atomic publication.
+    audit = _audit_sources(settings)
+    if not audit["status"].isin(["PASS", "FAIL_BYTES", "FAIL_SHA256"]).all():
+        raise PipelineError("Cannot refresh missing or unreadable source assets")
     document = build_manifest(settings)
     path = resolve_output(settings.repo_root, settings.sources["manifest"])
     if path in {
@@ -69,9 +74,9 @@ def main(argv: list[str] | None = None) -> int:
         _validate_run_id(settings.experiments["run_id"])
         # Validation writes the audit even when files are missing; start_run hashes
         # inputs and therefore must happen after validation, not before it.
+        validation_started = True
         if args.refresh_manifest:
             _refresh(settings)
-        validation_started = True
         audit = validate_sources(settings)
         for row in audit.to_dict("records"):
             print(

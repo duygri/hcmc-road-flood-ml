@@ -14,3 +14,9 @@ experiments:
   spatial_block_m: 5000
   holdout_fraction: 0.2
   guard_m: 1000
+  # Frozen origin-(0,0) metric grid; midpoint gives one block per road.
+  # Holdout iff SHA-256("seed:block_id") / 2**256 < holdout_fraction.
+  # No label, score or event quota changes block selection. Full lines are
+  # guarded against selected blocks AND holdout lines (including extensions).
+  # Effective guard = max(guard_m, 2 * max(configured feature buffer radii)).
+  # Pass both experiments and features sections to assign_spatial_partitions.

@@ -1,0 +1,5 @@
+sources:
+  # Portable default. Override raw_root in ignored configs/local/sources.yaml.
+  raw_root: data/raw
+  # Task 2 populates the inventory; Task 1 does not scan or process raw sources.
+  assets: []

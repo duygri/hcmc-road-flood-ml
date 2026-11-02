@@ -1,0 +1,16 @@
+experiments:
+  run_id: hcmc_old_v1_001
+  seed: 42
+  configs:
+    sources: configs/sources.yaml
+    study_area: configs/study_area.yaml
+    features: configs/features.yaml
+    labeling: configs/labeling.yaml
+  outputs:
+    interim: data/interim
+    processed: data/processed
+    reports: reports/runs
+    artifacts: artifacts
+  spatial_block_m: 5000
+  holdout_fraction: 0.2
+  guard_m: 1000

@@ -1,0 +1,4 @@
+labeling:
+  default_status: unknown
+  positive_requires_review: true
+  candidate_distance_m: 100

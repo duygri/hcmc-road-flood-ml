@@ -1,0 +1,6 @@
+features:
+  dem_buffer_m: 30
+  neighborhood_radius_m: 500
+  landcover_buffer_m: 250
+  water_buffer_m: 250
+  # Individual feature methods and source bindings are implemented in later tasks.

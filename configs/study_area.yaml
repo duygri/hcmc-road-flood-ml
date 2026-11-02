@@ -1,8 +1,14 @@
 study_area:
-  study_area_id: hcmc_old_pre_2025
+  study_area_id: hcmc_pre_2025
   target_crs: EPSG:9210
   boundary_selection:
     field: GhiChu
     value: TP. Ho CHi Minh
+  context:
+    # Derive halo via context_radius_m(features, raster_stencil_m=...) rather
+    # than storing a fixed buffer: max feature reach + raster support distance.
+    # Diagonal reach sqrt(2) * 30 m for a 3x3 slope stencil on a 30 m DEM
+    # grid; update this support distance with the raster grid/kernel.
+    raster_stencil_m: 42.42640687119285
   segment_target_m: 150
   segment_max_m: 200

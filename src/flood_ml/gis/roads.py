@@ -72,6 +72,47 @@ def _canonical(line):
     return LineString(coords)
 
 
+def _canonical_source(line, nodes):
+    """Canonical source start/direction, keeping each node at its own vertex.
+
+    A true OSM closed way repeats its first node reference. Compare both
+    directions and all cyclic starts; only a minimum coordinate can begin the
+    lexicographically smallest sequence. Geometrically coincident endpoints
+    with distinct references remain an open source traversal.
+    """
+    coords, nodes = list(line.coords), list(nodes)
+    candidates = []
+    if coords[0] == coords[-1] and nodes[0] == nodes[-1]:
+        ring_coords, ring_nodes = coords[:-1], nodes[:-1]
+        minimum = min(_coordinates(line)[:-1])
+        for points, refs in (
+            (ring_coords, ring_nodes),
+            (ring_coords[::-1], ring_nodes[::-1]),
+        ):
+            for i, point in enumerate(points):
+                if (
+                    tuple(round(float(v), CANONICAL_DECIMALS) for v in point[:2])
+                    == minimum
+                ):
+                    rotated_points = points[i:] + points[:i]
+                    rotated_refs = refs[i:] + refs[:i]
+                    candidates.append(
+                        (
+                            rotated_points + rotated_points[:1],
+                            rotated_refs + rotated_refs[:1],
+                        )
+                    )
+    else:
+        candidates = [(coords, nodes), (coords[::-1], nodes[::-1])]
+    return min(
+        candidates,
+        key=lambda candidate: (
+            _coordinates(LineString(candidate[0])),
+            tuple(map(str, candidate[1])),
+        ),
+    )
+
+
 def _active(value):
     return value is not None and str(value).strip().lower() not in {
         "",
@@ -165,8 +206,9 @@ def segment_roads(
     Structure level and the clipped interval's chainage along the canonically
     directed full source way are also part of chain identity. This source
     interval distinguishes repeated traversal of otherwise identical geometry.
-    Source direction compares rounded full coordinate sequences, with original
-    node IDs breaking symmetric-geometry ties. Hash rounding is not a
+    Source direction and closed-way cyclic start compare rounded full coordinate
+    sequences, with node IDs carried alongside vertices and breaking symmetric
+    geometry ties. Hash rounding is not a
     promise of stability across precision-cell boundaries or changed snapshots.
     Canonical orientation and sorted output remove input order/direction effects.
     """
@@ -196,7 +238,7 @@ def segment_roads(
         raise PipelineError("OSM way IDs must be nonnull and unique")
     config_digest = _hash(
         {
-            "version": 3,
+            "version": 4,
             "precision": CANONICAL_DECIMALS,
             "crs": aoi.crs.to_string(),
             "target_m": float(target_m),
@@ -220,6 +262,8 @@ def segment_roads(
             raise PipelineError(
                 "Each OSM LineString requires one source node ID per vertex"
             )
+        coords, nodes = _canonical_source(line, nodes)
+        row["_source_coords"], row["_source_nodes"] = coords, nodes
         level = _level(row)
         shared.update((node, level) for node in nodes)
     polygon = aoi.geometry.iloc[0]
@@ -231,12 +275,7 @@ def segment_roads(
         )
     output = []
     for row in records:
-        coords = list(row["geometry"].coords)
-        nodes = list(row["node_ids"])
-        source_key = (_coordinates(row["geometry"]), tuple(map(str, nodes)))
-        if (source_key[0][::-1], source_key[1][::-1]) < source_key:
-            coords.reverse()
-            nodes.reverse()
+        coords, nodes = row["_source_coords"], row["_source_nodes"]
         source_distances = [0.0]
         for a, b in itertools.pairwise(coords):
             source_distances.append(

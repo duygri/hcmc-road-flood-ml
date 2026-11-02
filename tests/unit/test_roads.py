@@ -224,6 +224,49 @@ def test_repeated_clipped_geometry_has_distinct_stable_source_traversal_ids(aoi,
     )
 
 
+@pytest.mark.parametrize("rotation", [1, 2, 3])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_closed_source_ring_rotation_preserves_segmentation_ids_and_geometry(
+    aoi, rotation, reverse
+):
+    aoi.geometry = [box(0, 0, 100, 100)]
+    coords = [(10, 20), (120, 20), (120, 80), (10, 80)]
+    nodes = [1, 2, 3, 4]
+    ways = gpd.GeoDataFrame(
+        {
+            "osm_way_id": ["ring"],
+            "node_ids": [nodes + nodes[:1]],
+            "highway_type": ["road"],
+        },
+        geometry=[LineString(coords + coords[:1])],
+        crs=9210,
+    )
+    baseline = segment(ways, aoi)
+    assert baseline.chain_id.nunique() == 2
+    assert baseline.length_m.tolist() == pytest.approx([150, 90], abs=1e-6)
+    expected_geometries = [
+        LineString([(10, 20), (10, 80), (100, 80)]),
+        LineString([(10, 20), (100, 20)]),
+    ]
+    assert baseline.geometry.to_wkb().tolist() == [
+        line.wkb for line in expected_geometries
+    ]
+    rotated_coords = coords[rotation:] + coords[:rotation]
+    rotated_nodes = nodes[rotation:] + nodes[:rotation]
+    rotated_coords += rotated_coords[:1]
+    rotated_nodes += rotated_nodes[:1]
+    if reverse:
+        rotated_coords.reverse()
+        rotated_nodes.reverse()
+    ways.geometry = [LineString(rotated_coords)]
+    ways["node_ids"] = [rotated_nodes]
+    result = segment(ways, aoi)
+    assert result.chain_id.nunique() == 2
+    assert result.length_m.tolist() == pytest.approx([150, 90], abs=1e-6)
+    assert result.road_segment_id.tolist() == baseline.road_segment_id.tolist()
+    assert result.geometry.to_wkb().tolist() == baseline.geometry.to_wkb().tolist()
+
+
 @pytest.mark.parametrize(
     "target,maximum", [(0, 200), (201, 200), (150, 0), (float("nan"), 200)]
 )

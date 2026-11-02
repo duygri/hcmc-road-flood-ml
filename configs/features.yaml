@@ -3,6 +3,15 @@ features:
   neighborhood_radius_m: 500
   landcover_buffer_m: 250
   water_buffer_m: 250
+  feature_columns:
+  - elevation_median_m
+  - elevation_p10_m
+  - relative_elevation_m
+  - slope_mean_deg
+  - builtup_ratio_250m
+  - vegetation_ratio_250m
+  - dist_water_m
+  - water_area_ratio_250m
   min_valid_fraction: 0.9
   # EPSG:9210 snapped grids: DEM bilinear at 30 m; WorldCover nearest at 10 m.
   # Horn 3x3 needs sqrt(2)*30 m support (study_area.context.raster_stencil_m).

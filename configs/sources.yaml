@@ -3,6 +3,10 @@ sources:
   raw_root: data/raw
   # Expected checksums and dataset metadata live in this tracked manifest.
   manifest: data/raw/manifest.yaml
+  water_coverage:
+    coverage_domain: old_hcmc_aoi
+    boundary_asset_id: administrative_boundaries
+    coverage_assumption: D04 completeness within the selected old-HCMC AOI is assumed, not independently verified; outside the AOI coverage is unknown.
   assets:
   - dataset_id: D01
     asset_id: flood_observations

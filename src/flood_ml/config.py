@@ -191,5 +191,7 @@ def load_settings(config_path: Path, *, repo_root: Path) -> Settings:
     crs = loaded["study_area"].get("target_crs")
     if not isinstance(crs, str) or not crs.strip():
         raise PipelineError("study_area.target_crs must be a nonempty string")
+    if loaded["labeling"].get("positive_requires_review") is not True:
+        raise PipelineError("labeling.positive_requires_review must be boolean true")
     sources["raw_root"] = raw_root
     return Settings(repo_root=repo_root, **loaded, experiments=experiments, seed=seed)

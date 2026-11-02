@@ -24,7 +24,7 @@ def repo(tmp_path):
         "sources": {"raw_root": "data/raw", "assets": []},
         "study_area": {"target_crs": "EPSG:9210"},
         "features": {"neighborhood_radius_m": 500},
-        "labeling": {"candidate_distance_m": 100},
+        "labeling": {"candidate_distance_m": 100, "positive_requires_review": True},
         "experiments": {
             "seed": 42,
             "run_id": "fixture_001",
@@ -81,6 +81,24 @@ def test_missing_seed_rejected(repo):
 def test_missing_section_rejected(repo):
     (repo / "configs/features.yaml").write_text("{}", encoding="utf-8")
     with pytest.raises(PipelineError):
+        load_settings(Path("configs/experiments.yaml"), repo_root=repo)
+
+
+def test_positive_review_requirement_accepts_true(repo):
+    settings = load_settings(Path("configs/experiments.yaml"), repo_root=repo)
+    assert settings.labeling["positive_requires_review"] is True
+
+
+@pytest.mark.parametrize("value", [False, "false", 0, 1, None, "true"])
+def test_positive_review_requirement_cannot_be_disabled_or_malformed(repo, value):
+    edit_section(repo, "labeling", lambda s: s.update(positive_requires_review=value))
+    with pytest.raises(PipelineError, match="positive_requires_review"):
+        load_settings(Path("configs/experiments.yaml"), repo_root=repo)
+
+
+def test_positive_review_requirement_must_be_explicit(repo):
+    edit_section(repo, "labeling", lambda s: s.pop("positive_requires_review"))
+    with pytest.raises(PipelineError, match="positive_requires_review"):
         load_settings(Path("configs/experiments.yaml"), repo_root=repo)
 
 

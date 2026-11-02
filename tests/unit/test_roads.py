@@ -201,6 +201,29 @@ def test_clip_keeps_separate_traversals_after_outside_excursion_to_same_boundary
     assert sorted(result.length_m) == pytest.approx([90, 130], abs=1e-6)
 
 
+@pytest.mark.parametrize("nodes", [[1, 2, 3, 4, 5], [1, 2, 3, 2, 1]])
+def test_repeated_clipped_geometry_has_distinct_stable_source_traversal_ids(aoi, nodes):
+    aoi.geometry = [box(0, 0, 100, 100)]
+    ways = gpd.GeoDataFrame(
+        {"osm_way_id": ["repeated"], "node_ids": [nodes], "highway_type": ["road"]},
+        geometry=[LineString([(10, 50), (100, 50), (120, 50), (100, 50), (10, 50)])],
+        crs=9210,
+    )
+    result = segment(ways, aoi)
+    assert len(result) == 2
+    assert result.chain_id.nunique() == 2
+    assert result.road_segment_id.is_unique
+    assert result.geometry.to_wkb().nunique() == 1
+    assert result.length_m.tolist() == pytest.approx([90, 90], abs=1e-6)
+    ways.geometry = ways.geometry.map(lambda line: LineString(list(line.coords)[::-1]))
+    ways["node_ids"] = [nodes[::-1]]
+    reversed_result = segment(ways, aoi)
+    assert reversed_result.road_segment_id.tolist() == result.road_segment_id.tolist()
+    assert (
+        reversed_result.geometry.to_wkb().tolist() == result.geometry.to_wkb().tolist()
+    )
+
+
 @pytest.mark.parametrize(
     "target,maximum", [(0, 200), (201, 200), (150, 0), (float("nan"), 200)]
 )

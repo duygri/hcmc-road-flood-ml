@@ -108,9 +108,10 @@ def _clip_traversal(chain, polygon):
     so reversing the source cannot introduce different clipping roundoff.
     """
     if polygon.covers(chain):
-        yield chain
+        yield chain, 0.0, chain.length
         return
     pending = []
+    pending_start = None
     previous_end = None
     traversed = 0.0
     for start, end in itertools.pairwise(chain.coords):
@@ -132,12 +133,13 @@ def _clip_traversal(chain, polygon):
                 pending.extend(coords[1:])
             else:
                 if pending:
-                    yield LineString(pending)
+                    yield LineString(pending), pending_start, previous_end
                 pending = coords
+                pending_start = source_start
             previous_end = source_end
         traversed += edge.length
     if pending:
-        yield LineString(pending)
+        yield LineString(pending), pending_start, previous_end
 
 
 def segment_roads(
@@ -160,7 +162,11 @@ def segment_roads(
     IDs are SHA-256 of snapshot, source way ID, canonical chain coordinate
     sequence rounded to 6 decimals, segment chainage rounded to 6 decimals, and
     a config digest (algorithm version, precision, metric CRS, target, maximum).
-    Structure level is also part of chain identity. Hash rounding is not a
+    Structure level and the clipped interval's chainage along the canonically
+    directed full source way are also part of chain identity. This source
+    interval distinguishes repeated traversal of otherwise identical geometry.
+    Source direction compares rounded full coordinate sequences, with original
+    node IDs breaking symmetric-geometry ties. Hash rounding is not a
     promise of stability across precision-cell boundaries or changed snapshots.
     Canonical orientation and sorted output remove input order/direction effects.
     """
@@ -190,7 +196,7 @@ def segment_roads(
         raise PipelineError("OSM way IDs must be nonnull and unique")
     config_digest = _hash(
         {
-            "version": 2,
+            "version": 3,
             "precision": CANONICAL_DECIMALS,
             "crs": aoi.crs.to_string(),
             "target_m": float(target_m),
@@ -226,28 +232,41 @@ def segment_roads(
     output = []
     for row in records:
         coords = list(row["geometry"].coords)
+        nodes = list(row["node_ids"])
+        source_key = (_coordinates(row["geometry"]), tuple(map(str, nodes)))
+        if (source_key[0][::-1], source_key[1][::-1]) < source_key:
+            coords.reverse()
+            nodes.reverse()
+        source_distances = [0.0]
+        for a, b in itertools.pairwise(coords):
+            source_distances.append(
+                source_distances[-1] + math.hypot(b[0] - a[0], b[1] - a[1])
+            )
         level = _level(row)
         cuts = (
             [0]
-            + [
-                i
-                for i, node in enumerate(row["node_ids"][1:-1], 1)
-                if shared[node, level] > 1
-            ]
+            + [i for i, node in enumerate(nodes[1:-1], 1) if shared[node, level] > 1]
             + [len(coords) - 1]
         )
         for start, end in itertools.pairwise(cuts):
-            topology_chain = _canonical(LineString(coords[start : end + 1]))
+            topology_chain = LineString(coords[start : end + 1])
             if not polygon.intersects(topology_chain):
                 continue
-            for clipped in _clip_traversal(topology_chain, polygon):
+            for clipped, source_lo, source_hi in _clip_traversal(
+                topology_chain, polygon
+            ):
                 chain = _canonical(clipped)
                 chain_key = _coordinates(chain)
+                source_interval = (
+                    round(source_distances[start] + source_lo, CANONICAL_DECIMALS),
+                    round(source_distances[start] + source_hi, CANONICAL_DECIMALS),
+                )
                 chain_id = _hash(
                     [
                         snapshot_date,
                         str(row["osm_way_id"]),
                         chain_key,
+                        source_interval,
                         level,
                         config_digest,
                     ]
@@ -283,10 +302,16 @@ def segment_roads(
                             "chainage_start_m": lo,
                             "chainage_end_m": hi,
                             "_chain_key": chain_key,
+                            "_source_interval": source_interval,
                         }
                     )
     output.sort(
-        key=lambda row: (row["osm_way_id"], row["_chain_key"], row["chainage_start_m"])
+        key=lambda row: (
+            row["osm_way_id"],
+            row["_chain_key"],
+            row["_source_interval"],
+            row["chainage_start_m"],
+        )
     )
     result = gpd.GeoDataFrame(
         output, columns=SEGMENT_COLUMNS, geometry="geometry", crs=aoi.crs

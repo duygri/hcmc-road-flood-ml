@@ -1,5 +1,39 @@
 sources:
-  # Portable default. Override raw_root in ignored configs/local/sources.yaml.
+  # Local override may supply an external read-only raw_root.
   raw_root: data/raw
-  # Task 2 populates the inventory; Task 1 does not scan or process raw sources.
-  assets: []
+  # Expected checksums and dataset metadata live in this tracked manifest.
+  manifest: data/raw/manifest.yaml
+  assets:
+  - dataset_id: D01
+    asset_id: flood_observations
+    path: HCMC_Floods_BDD.gpkg
+  - dataset_id: D01
+    asset_id: administrative_boundaries
+    path: HCMC_new_limits.gpkg
+  - dataset_id: D04
+    asset_id: water
+    path: HCMC_water.gpkg
+  - dataset_id: D01
+    asset_id: ird_readme
+    path: ReadMe_10_23708_8Y16HU.txt
+  - dataset_id: D01
+    asset_id: ird_dictionary
+    path: Metadata-form-HCMC-floods.pdf
+  - dataset_id: D02
+    asset_id: d02_vietnam-latest.osm
+    path: vietnam-latest.osm.pbf
+  - dataset_id: D03
+    asset_id: d03_N10E106_FABDEM_V1-2
+    path: fabdem_tiles/N10E106_FABDEM_V1-2.tif
+  - dataset_id: D03
+    asset_id: d03_N10E107_FABDEM_V1-2
+    path: fabdem_tiles/N10E107_FABDEM_V1-2.tif
+  - dataset_id: D03
+    asset_id: d03_N11E106_FABDEM_V1-2
+    path: fabdem_tiles/N11E106_FABDEM_V1-2.tif
+  - dataset_id: D03
+    asset_id: d03_N11E107_FABDEM_V1-2
+    path: fabdem_tiles/N11E107_FABDEM_V1-2.tif
+  - dataset_id: D05
+    asset_id: d05_ESA_WorldCover_10m_2021_v200_N09E105_Map
+    path: ESA_WorldCover_10m_2021_v200_N09E105_Map.tif

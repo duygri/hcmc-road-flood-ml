@@ -1,0 +1,224 @@
+manifest_version: 2
+study_area_support:
+  bbox_epsg4326:
+  - 106.356636
+  - 10.3785763
+  - 107.0275421
+  - 11.1602297
+  derived_from: HCMC_water.gpkg extent
+  note: Available source coverage only. The study AOI is selected separately using
+    the boundary asset and filter in configs/study_area.yaml.
+datasets:
+- title: Historical database of urban flooding in Ho Chi Minh City, Vietnam (2002–2026)
+  source_url: https://doi.org/10.23708/8Y16HU
+  version: DataSuds v1.0, published 2026-09-09
+  period: 2002–2026
+  attribution: 'Hardy, Sebastien; Radziute, Gintaré (2026). DataSuds. DOI: 10.23708/8Y16HU.'
+  license: 'Conflict: Dataverse metadata says CC BY-NC 4.0; bundled ReadMe says CC
+    BY 4.0. Treat as CC BY-NC 4.0 pending clarification.'
+  inspection:
+  - '425 observations from 53 source IDs: 390 newspaper and 35 technical-report records.'
+  - 63 observations have no exact date.
+  - 'Geocoding: 341 street points, 72 area points, 10 exact points, 2 ward points.'
+  - Precision values contain whitespace and spelling variants; normalize into a separate
+    field and preserve source values.
+  - No verified-negative labels are supplied. Do not turn roads without reports into
+    negative samples.
+  - Deduplicate repeated reports/events and manually review uncertain point-to-road
+    matches.
+  dataset_id: D01
+  downloaded_on: '2026-11-02'
+  crs: 'unknown: asset-dependent; see individual assets'
+  resolution: 'unknown: vector geometry has no uniform spatial resolution'
+  scope: Historical reported flood locations in Ho Chi Minh City; positive evidence
+    only
+  coverage_assumption: 'unknown: coverage is source coverage; completeness within
+    final AOI not independently verified'
+  assets:
+  - path: HCMC_Floods_BDD.gpkg
+    source_file_id: 50143
+    bytes: 249856
+    crs: EPSG:9210
+    layer: Flood_event_locations
+    features: 425
+    source_md5: 1f618063abb8344471af01b3780c0519
+    sha256: e0ea50ababae30cd93ac52fb3e42f0b28a8c8da946ed7129d263372883a698ee
+    asset_id: flood_observations
+    role: primary
+  - path: HCMC_new_limits.gpkg
+    source_file_id: 50144
+    bytes: 507904
+    crs: EPSG:9210
+    layer: Limits_before_2025_administrative_reform
+    features: 4
+    source_md5: 9f2cca3c0fd516fbae3802ab51493e26
+    sha256: 96d5a65c4d64d288f387eb6d574cb14fdb00e3488f28bf6fd680c57af0cd55f5
+    note: Contains HCMC, Bình Dương, Bà Rịa–Vũng Tàu, and Côn Đảo boundaries; do not
+      assume the full post-2025 extent is the study AOI.
+    asset_id: administrative_boundaries
+    role: supporting
+  - path: ReadMe_10_23708_8Y16HU.txt
+    bytes: 1705
+    sha256: 4975d75f2f3af387a1140d3f79d2dc0e4507e95a90c3f5fd11b738f96c15b0ca
+    role: supporting
+    asset_id: ird_readme
+  - path: Metadata-form-HCMC-floods.pdf
+    bytes: 43338
+    sha256: 03f921974b9df49feb1865310dea8cb3f52bbdef1e3d19a0fc57ce70c4206ca9
+    role: supporting
+    asset_id: ird_dictionary
+- title: OpenStreetMap Vietnam extract
+  source_url: https://download.geofabrik.de/asia/vietnam.html
+  file_url: https://download.geofabrik.de/asia/vietnam-latest.osm.pbf
+  version: Geofabrik latest extract, page timestamp 2026-11-02
+  snapshot_date: '2026-11-02'
+  format: OSM PBF
+  license: Open Database License 1.0 (ODbL)
+  attribution: © OpenStreetMap contributors
+  source_md5: d6aca64e78070d08f0543cf12c966014
+  inspection:
+  - Downloaded PBF MD5 matches Geofabrik's published checksum.
+  - The lines layer is readable. A spatial-filtered inspection returned 324860 line
+    features around the IRD water extent; 302881 have a highway tag.
+  - Some returned ways extend beyond the filter bounds; clip geometries to the selected
+    AOI before segmentation.
+  dataset_id: D02
+  downloaded_on: '2026-11-02'
+  period: 'unknown: acquisition vintage is not established by supplied metadata; release
+    date is not observation date'
+  crs: 'unknown: asset-dependent; see individual assets'
+  resolution: 'unknown: vector geometry has no uniform spatial resolution'
+  scope: Vietnam extract; must clip roads to selected old-HCMC polygon
+  coverage_assumption: 'unknown: coverage is source coverage; completeness within
+    final AOI not independently verified'
+  assets:
+  - bytes: 332038421
+    sha256: 74f9b46d8c5359fd53efe90a10f1bfa5a13a5fd90466195494a0b9edd2b3489e
+    path: vietnam-latest.osm.pbf
+    asset_id: d02_vietnam-latest.osm
+    role: primary
+- title: FABDEM v1.2
+  source_url: https://data.bris.ac.uk/datasets/s5hqmjcdj8yo2ibzi9b4ew3sn/
+  source_archive: https://data.bris.ac.uk/datasets/s5hqmjcdj8yo2ibzi9b4ew3sn/N10E100-N20E110_FABDEM_V1-2.zip
+  version: FABDEM V1-2, January 2023 release
+  license: CC BY-NC-SA 4.0
+  attribution: Hawker et al. (2022), A 30 m global map of elevation with forests and
+    buildings removed, Environmental Research Letters 17(2), 024016. Retain the Copernicus
+    WorldDEM-30 attribution specified in the upstream readme.
+  crs: EPSG:4326; vertical datum EGM2008
+  resolution: 1 arc-second, approximately 30 m
+  subset_basis: Four 1x1 degree tiles intersecting the IRD water-layer extent
+  inspection:
+  - All four GeoTIFFs open successfully, use float32, are 3600x3600, and contain valid
+    data.
+  - Recompute elevation summaries within the final AOI; whole-tile min/max include
+    land and water outside the study area.
+  dataset_id: D03
+  downloaded_on: '2026-11-02'
+  period: 'unknown: acquisition vintage is not established by supplied metadata; release
+    date is not observation date'
+  scope: Four 1x1 degree tiles intersecting the IRD water-layer extent
+  coverage_assumption: 'unknown: coverage is source coverage; completeness within
+    final AOI not independently verified'
+  assets:
+  - path: fabdem_tiles/N10E106_FABDEM_V1-2.tif
+    bytes: 14427858
+    bounds_epsg4326:
+    - 105.9998611
+    - 10.0001389
+    - 106.9998611
+    - 11.0001389
+    nodata: -9999
+    sha256: 4e950b275dcc2cffcfa13d816919c0de5de938e89fbe7a375e46543671a4207a
+    asset_id: d03_N10E106_FABDEM_V1-2
+    role: primary
+  - path: fabdem_tiles/N10E107_FABDEM_V1-2.tif
+    bytes: 10835533
+    bounds_epsg4326:
+    - 106.9998611
+    - 10.0001389
+    - 107.9998611
+    - 11.0001389
+    nodata: -9999
+    sha256: bf631c6a7c66ed3fd34068ed9befd73003d937f58cc60dd5bbd4b9e6686ec733
+    asset_id: d03_N10E107_FABDEM_V1-2
+    role: primary
+  - path: fabdem_tiles/N11E106_FABDEM_V1-2.tif
+    bytes: 22272624
+    bounds_epsg4326:
+    - 105.9998611
+    - 11.0001389
+    - 106.9998611
+    - 12.0001389
+    nodata: -9999
+    sha256: 71527bc02bd73f9c311bea453e08f9748c19f35d8cedd94c48d9f4cb568fe65a
+    asset_id: d03_N11E106_FABDEM_V1-2
+    role: primary
+  - path: fabdem_tiles/N11E107_FABDEM_V1-2.tif
+    bytes: 26337514
+    bounds_epsg4326:
+    - 106.9998611
+    - 11.0001389
+    - 107.9998611
+    - 12.0001389
+    nodata: -9999
+    sha256: 7cd060231db159b1d44ca033a540b4516332d5074e914412b869c40c678b4990
+    asset_id: d03_N11E107_FABDEM_V1-2
+    role: primary
+- title: IRD HCMC rivers, main canals and water bodies
+  source_url: https://doi.org/10.23708/8Y16HU
+  version: DataSuds v1.0, published 2026-09-09
+  period: 'unknown: water-layer mapping vintage not supplied'
+  attribution: 'Hardy, Sebastien; Radziute, Gintaré (2026). DataSuds. DOI: 10.23708/8Y16HU.'
+  license: 'Conflict: Dataverse metadata says CC BY-NC 4.0; bundled ReadMe says CC
+    BY 4.0. Treat as CC BY-NC 4.0 pending clarification.'
+  dataset_id: D04
+  downloaded_on: '2026-11-02'
+  crs: EPSG:4326
+  resolution: 'unknown: vector geometry; mapping scale not supplied'
+  scope: HCMC water source layer
+  coverage_assumption: 'unknown: coverage domain requires an explicit source AOI assumption;
+    polygon extent does not prove completeness'
+  assets:
+  - path: HCMC_water.gpkg
+    source_file_id: 50145
+    bytes: 4243456
+    crs: EPSG:4326
+    layer: Rivers__main_canals_and_water_bodies
+    features: 2430
+    bounds_epsg4326:
+    - 106.356636
+    - 10.3785763
+    - 107.0275421
+    - 11.1602297
+    source_md5: 0590430eca0e97e1fe2ec6b7af3e2eb5
+    sha256: d51cb71b184405199358dd0f1d514519f4ceb2d0924a3f63b662dd586b95bba6
+    asset_id: water
+    role: primary
+- title: ESA WorldCover 2021 v200
+  source_url: https://esa-worldcover.org/en/data-access
+  file_url: https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/ESA_WorldCover_10m_2021_v200_N09E105_Map.tif
+  version: 2021 v200 / algorithm V2.0.0
+  period: '2021'
+  license: CC BY 4.0
+  attribution: © ESA WorldCover project 2021 / Contains modified Copernicus Sentinel
+    data (2021) processed by ESA WorldCover consortium.
+  format: Cloud Optimized GeoTIFF
+  crs: EPSG:4326
+  resolution: 10 m product; native grid is 36000x36000 for this 3x3 degree tile
+  nodata: 0
+  inspection:
+  - Tile N09E105 covers 105–108E and 9–12N, including the IRD water-layer bounds.
+  - Contains WorldCover classes 10, 20, 30, 40, 50, 60, 80, 90, and 95.
+  - No nodata pixels occur inside the bounding window of HCMC_water.gpkg.
+  dataset_id: D05
+  downloaded_on: '2026-11-02'
+  scope: 'N09E105 tile: 105–108 E, 9–12 N'
+  coverage_assumption: 'unknown: coverage is source coverage; completeness within
+    final AOI not independently verified'
+  assets:
+  - bytes: 92338709
+    sha256: 7e9c655b7eefe460f92f0a15122295d33b33c3e1493afd56a463fb973dcc1cbc
+    path: ESA_WorldCover_10m_2021_v200_N09E105_Map.tif
+    asset_id: d05_ESA_WorldCover_10m_2021_v200_N09E105_Map
+    role: primary

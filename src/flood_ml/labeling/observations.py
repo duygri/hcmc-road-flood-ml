@@ -11,6 +11,7 @@ import json
 import math
 import re
 from datetime import date, datetime
+from numbers import Integral
 
 import geopandas as gpd
 import pandas as pd
@@ -71,11 +72,35 @@ def _date(value, year):
 
 
 def _ids(frame):
+    """Return string keys; reject ambiguous types and representation collisions.
+
+    Nonblank strings and integers are supported. Repeated identical source keys
+    are valid links; different representations of one canonical source key are
+    ambiguous. Observation keys must be unique after conversion in every case.
+    """
+    frame = frame.copy()
     for name in ("observation_id", "source_id"):
-        if name not in frame or frame[name].map(_missing).any():
+        if name not in frame:
             raise PipelineError(f"Missing {name}")
+        canonical = []
+        representations = {}
+        for value in frame[name]:
+            if isinstance(value, str) and value.strip():
+                key, representation = value, ("str", value)
+            elif isinstance(value, Integral) and not isinstance(value, bool):
+                key, representation = str(int(value)), ("int", int(value))
+            else:
+                raise PipelineError(
+                    f"Invalid or ambiguous {name}: expected string or integer"
+                )
+            if key in representations and representations[key] != representation:
+                raise PipelineError(f"Canonical conversion collision in {name}")
+            representations[key] = representation
+            canonical.append(key)
+        frame[name] = pd.Series(canonical, index=frame.index, dtype="str")
     if frame.observation_id.duplicated().any():
         raise PipelineError("Duplicate observation_id")
+    return frame
 
 
 def normalize_observations(
@@ -114,7 +139,7 @@ def normalize_observations(
     for canonical, native in [("observation_id", "Obs_id"), ("source_id", "Source_id")]:
         if canonical not in result and native in result:
             result[canonical] = result[native]
-    _ids(result)
+    result = _ids(result)
     result = result.to_crs(checked.crs).reset_index(drop=True)
     polygon = checked.geometry.iloc[0]
     result["outside_aoi"] = ~result.geometry.map(polygon.covers).astype(bool)
@@ -187,7 +212,7 @@ def propose_event_groups(observations: gpd.GeoDataFrame, config: dict) -> pd.Dat
     source_ids and candidate_edges are JSON for portable review-table storage.
     """
     require_metric_crs(observations)
-    _ids(observations)
+    observations = _ids(observations)
     thresholds = []
     for name in ("candidate_distance_m", "candidate_time_days"):
         value = config.get(name)

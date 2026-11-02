@@ -115,6 +115,47 @@ def test_explicit_stable_record_keys_preserve_duplicate_native_ids(aoi):
     )
 
 
+def test_mixed_supported_ids_normalize_without_losing_original_values(aoi):
+    source = pd.concat([raw(), raw()], ignore_index=True)
+    source["observation_id"] = [1, "2"]
+    source["source_id"] = [3, "4"]
+    result = normalize_observations(source, aoi)
+    assert result.observation_id.tolist() == ["1", "2"]
+    assert result.source_id.tolist() == ["3", "4"]
+    assert result.raw_observation_id.tolist() == [1, "2"]
+    assert result.raw_source_id.tolist() == [3, "4"]
+    grouped = propose_event_groups(
+        result, {"candidate_distance_m": 100, "candidate_time_days": 1}
+    )
+    assert grouped.observation_id.tolist() == ["1", "2"]
+    assert grouped.source_id.tolist() == ["3", "4"]
+    assert source.observation_id.tolist() == [1, "2"]
+
+
+@pytest.mark.parametrize("field", ["observation_id", "source_id"])
+def test_post_conversion_id_collisions_fail_explicitly(field, aoi):
+    source = pd.concat([raw(), raw()], ignore_index=True)
+    source["observation_id"] = ["a", "b"]
+    source[field] = [1, "1"]
+    with pytest.raises(PipelineError, match=field):
+        normalize_observations(source, aoi)
+    normalized = observations(aoi)
+    normalized[field] = pd.Series([1, "1", "c", "d", "e"], dtype=object)
+    with pytest.raises(PipelineError, match=field):
+        propose_event_groups(
+            normalized, {"candidate_distance_m": 100, "candidate_time_days": 1}
+        )
+
+
+@pytest.mark.parametrize("value", [True, 1.5, ["nested"], {"key": "value"}])
+@pytest.mark.parametrize("field", ["observation_id", "source_id"])
+def test_ambiguous_id_values_raise_pipeline_error(field, value, aoi):
+    source = raw()
+    source[field] = pd.Series([value], dtype=object)
+    with pytest.raises(PipelineError, match=field):
+        normalize_observations(source, aoi)
+
+
 def observations(aoi):
     return normalize_observations(
         raw(

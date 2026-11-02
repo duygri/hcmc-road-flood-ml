@@ -57,10 +57,31 @@ def main(argv=None):
             args.output
             or f"{settings.experiments['outputs']['reports']}/{run_id}/evaluation.json",
         )
+        # Match load_settings' validated entry/bundle/link resolution, rather
+        # than assuming config files live under configs/ or end in .yaml.
+        selected_config = (
+            args.config.resolve()
+            if args.config.is_absolute()
+            else resolve_output(settings.repo_root, str(args.config))
+        )
+        configuration_paths = {
+            selected_config,
+            *(
+                resolve_output(settings.repo_root, value)
+                for value in settings.experiments["configs"].values()
+            ),
+        }
+        if selected_config.stem != "experiments":
+            configuration_paths.add(
+                resolve_output(settings.repo_root, "configs/experiments.yaml")
+            )
+        local_sources = resolve_output(settings.repo_root, "configs/local/sources.yaml")
+        if local_sources.exists():
+            configuration_paths.add(local_sources)
         # All checks precede writes; canonical paths and hard links are guarded.
         protected = [
             *paths.values(),
-            *list((settings.repo_root / "configs").rglob("*.yaml")),
+            *configuration_paths,
         ]
         if output.is_relative_to(settings.sources["raw_root"]):
             raise PipelineError("Evaluation report cannot overwrite raw sources")

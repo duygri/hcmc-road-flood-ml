@@ -458,3 +458,88 @@ def test_cli_atomically_writes_real_empty_review_pending(tmp_path, capture_case)
     arguments[-1] = "scores.parquet"
     assert cli.main(arguments) == 1
     assert scores.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "target,hardlink,absolute_entry",
+    [
+        ("selected_yaml", False, False),
+        ("selected_yml", False, False),
+        ("selected_yml", False, True),
+        ("selected_yml", True, False),
+        ("sources", False, False),
+        ("study_area", False, False),
+        ("features", False, False),
+        ("labeling", False, False),
+        ("features", True, False),
+        ("section_entry", False, False),
+    ],
+)
+def test_cli_rejects_actual_loaded_config_alias_before_writes(
+    tmp_path, capture_case, capsys, target, hardlink, absolute_entry
+):
+    import os
+    import shutil
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    shutil.copytree(root / "configs", tmp_path / "configs")
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    experiments = yaml.safe_load((tmp_path / "configs/experiments.yaml").read_text())
+    selected = custom / (
+        "experiments.yaml" if target == "selected_yaml" else "experiments.yml"
+    )
+    if target in {"sources", "study_area", "features", "labeling"}:
+        destination = custom / f"{target}.bundle"
+        shutil.copyfile(tmp_path / f"configs/{target}.yaml", destination)
+        experiments["experiments"]["configs"][target] = str(
+            destination.relative_to(tmp_path)
+        )
+    elif target == "section_entry":
+        selected = custom / "features.yml"
+        shutil.copyfile(tmp_path / "configs/features.yaml", selected)
+        destination = selected
+    else:
+        destination = selected
+    if target != "section_entry":
+        selected.write_text(yaml.safe_dump(experiments))
+    if hardlink:
+        alias = custom / "report.json"
+        os.link(destination, alias)
+        destination = alias
+    capture_case["scores"].to_parquet(tmp_path / "scores.parquet")
+    capture_case["roads"].to_parquet(tmp_path / "roads.parquet")
+    pd.DataFrame(columns=LINK_COLUMNS).to_parquet(tmp_path / "events.parquet")
+    capture_case["partitions"].to_parquet(tmp_path / "partitions.parquet")
+    entry = str(selected) if absolute_entry else str(selected.relative_to(tmp_path))
+    arguments = [
+        "--repo-root",
+        str(tmp_path),
+        "--config",
+        entry,
+        "--scores",
+        "scores.parquet",
+        "--roads",
+        "roads.parquet",
+        "--confirmed-event-segments",
+        "events.parquet",
+        "--partitions",
+        "partitions.parquet",
+        "--output",
+        str(destination.relative_to(tmp_path)),
+    ]
+
+    def snapshot():
+        return {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    result = load_cli().main(arguments)
+    assert snapshot() == before  # Also proves no report/start/QC marker was added.
+    assert result == 1
+    assert "aliases publication destination" in capsys.readouterr().err

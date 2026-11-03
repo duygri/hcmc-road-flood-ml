@@ -41,8 +41,8 @@ passed on synthetic rasters, including adjacent tile boundaries and nodata.
 Across the two full runs, raster features, assembled road features and MCDA
 scores had identical ordered road IDs and zero numeric difference (all values
 within absolute tolerance 1e-6). Their stage output hashes also match their
-completion markers; the comparison and SHA-256 inventory are in
-`.superpowers/sdd/2026-11-02-old-hcmc-baseline/task-12-real-replay-qc.json`.
+completion markers; the comparison and SHA-256 inventory are in the local
+`reports/runs/hcmc_old_v1_005/replay_comparison.json` artifact.
 
 Both full runs completed with 9,059 candidate links, 7 observations outside
 the AOI, and 298,199 unknown labels. The split contained 226,824 reference,

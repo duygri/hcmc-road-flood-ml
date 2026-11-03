@@ -876,8 +876,6 @@ def run_pipeline(
     run_record = _read_json(context.reports_dir / "run.json")
     lock = paths["lock"]
     paths["stage_dir"].mkdir(parents=True, exist_ok=True)
-    if paths["complete"].exists():
-        paths["complete"].unlink()
     try:
         with lock.open("x", encoding="utf-8") as stream:
             stream.write(json.dumps({"pid": os.getpid(), "run_id": context.run_id}))
@@ -890,6 +888,7 @@ def run_pipeline(
     tainted = set()
     records = {}
     try:
+        paths["complete"].unlink(missing_ok=True)
         functions = _stage_functions(settings, context, paths)
         for stage in plan:
             dependencies = STAGE_DEPENDENCIES[stage]

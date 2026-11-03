@@ -218,6 +218,23 @@ def test_failure_has_no_stage_completion_marker(synthetic_pipeline):
     assert not (context.reports_dir / "pipeline_complete.json").exists()
 
 
+def test_rejected_concurrent_run_preserves_completion_marker(synthetic_pipeline):
+    from flood_ml.pipeline import run_pipeline
+
+    settings, context = synthetic_pipeline
+    run_pipeline(settings, context)
+    marker = context.reports_dir / "pipeline_complete.json"
+    before = marker.read_bytes()
+    (context.reports_dir / ".pipeline.lock").write_text(
+        '{"pid": 123456789, "run_id": "synthetic"}', encoding="utf-8"
+    )
+
+    with pytest.raises(PipelineError, match="already running or stale lock"):
+        run_pipeline(settings, context)
+
+    assert marker.read_bytes() == before
+
+
 def test_manifest_metadata_and_config_changes_reject_run_reuse(synthetic_pipeline):
     settings, context = synthetic_pipeline
     manifest = settings.repo_root / settings.sources["manifest"]

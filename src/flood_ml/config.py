@@ -79,6 +79,9 @@ def _validate_values(value, name: str) -> None:
     elif value is not None and not isinstance(value, (str, bool, int, float)):
         raise PipelineError(f"{name}: unsupported YAML value type")
     key = name.rsplit(".", 1)[-1]
+    # A background count ratio is validated separately, and may exceed one.
+    if name == "experiments.track_b.primary_background_ratio":
+        return
     if key.endswith(("_m", "_fraction", "_ratio")):
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise PipelineError(f"{name}: expected a finite nonnegative number")
@@ -86,6 +89,47 @@ def _validate_values(value, name: str) -> None:
             raise PipelineError(f"{name}: expected a number in [0, 1]")
     if isinstance(value, float) and not math.isfinite(value):
         raise PipelineError(f"{name}: nonfinite numbers are not allowed")
+
+
+def _validate_track_b(config) -> None:
+    """Keep the approved pilot settings fixed before any run is initialized."""
+    expected = {
+        "feature_columns": [
+            "elevation_median_m",
+            "relative_elevation_m",
+            "slope_mean_deg",
+            "dist_water_m",
+            "builtup_ratio_250m",
+        ],
+        "primary_background_ratio": 10,
+        "sensitivity_background_ratios": [5, 20],
+        "seed_start": 42,
+        "seed_repetitions": 20,
+        "minimum_reference_events": 20,
+        "logistic_regression": {"C": 1.0, "max_iter": 1000},
+    }
+    if not isinstance(config, dict) or set(config) != set(expected):
+        raise PipelineError("experiments.track_b requires the predeclared settings")
+    for key, value in expected.items():
+        actual = config[key]
+        valid_type = (
+            type(actual) is int
+            if type(value) is int
+            else isinstance(actual, type(value))
+        )
+        if isinstance(value, list) and key == "sensitivity_background_ratios":
+            valid_type = valid_type and all(type(item) is int for item in actual)
+        if key == "logistic_regression":
+            valid_type = (
+                valid_type
+                and set(actual) == {"C", "max_iter"}
+                and type(actual["C"]) in (int, float)
+                and type(actual["max_iter"]) is int
+            )
+        if not valid_type or actual != value:
+            raise PipelineError(
+                f"experiments.track_b.{key} must match the predeclared value"
+            )
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -197,6 +241,8 @@ def load_settings(config_path: Path, *, repo_root: Path) -> Settings:
         output = resolve_output(repo_root, value)
         if output.is_relative_to(raw_root) or raw_root.is_relative_to(output):
             raise PipelineError("Output directories must not overlap raw_root")
+    if "track_b" in experiments:
+        _validate_track_b(experiments["track_b"])
     for section, values in {**loaded, "experiments": experiments}.items():
         _validate_values(values, section)
         if "seed" in values and (

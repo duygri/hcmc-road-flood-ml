@@ -522,6 +522,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "geopandas" },
+    { name = "joblib" },
     { name = "matplotlib" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -547,6 +548,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "geopandas", specifier = ">=1.0" },
+    { name = "joblib", specifier = ">=1.5" },
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "osmium", specifier = ">=4.0" },

@@ -29,6 +29,22 @@ experiments:
     random_repetitions: 100
     bootstrap_seed: 42
     bootstrap_repetitions: 1000
+  track_b:
+    # Reviewed reference positives vs sampled unknown background; relative scores.
+    feature_columns:
+      - elevation_median_m
+      - relative_elevation_m
+      - slope_mean_deg
+      - dist_water_m
+      - builtup_ratio_250m
+    primary_background_ratio: 10
+    sensitivity_background_ratios: [5, 20]
+    seed_start: 42
+    seed_repetitions: 20
+    minimum_reference_events: 20
+    logistic_regression:
+      C: 1.0
+      max_iter: 1000
   mcda:
     # Predeclared hypothesis; no fitting or selection against flood labels.
     feature_spec:

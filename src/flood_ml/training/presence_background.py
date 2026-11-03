@@ -113,6 +113,9 @@ def score_track_b(
     )
     selected = features.loc[eligible]
     matrix = values.loc[eligible, FEATURE_COLUMNS]
+    if selected.empty:
+        return pd.DataFrame(columns=SCORE_COLUMNS)
+
     rows = []
     for fitted in models:
         scores = fitted.estimator.decision_function(matrix)

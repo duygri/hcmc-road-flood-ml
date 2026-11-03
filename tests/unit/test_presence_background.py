@@ -134,6 +134,23 @@ def test_score_track_b_excludes_missing_nonfinite_or_ineligible_rows():
     )
 
 
+def test_score_track_b_returns_empty_schema_when_no_rows_are_eligible():
+    fitted = fit_track_b(draw())
+    features = score_frame().assign(score_eligible=False)
+
+    scores = score_track_b([fitted], features)
+
+    assert scores.empty
+    assert scores.columns.tolist() == [
+        "road_segment_id",
+        "model_id",
+        "background_ratio",
+        "seed",
+        "relative_score",
+        "partition",
+    ]
+
+
 def test_scores_are_long_form_unique_and_repeatable():
     first_model = fit_track_b(draw())
     second_draw = replace(draw(), model_id="track_b_r10_s43", seed=43)

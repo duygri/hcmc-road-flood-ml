@@ -66,12 +66,40 @@ def _hash_file(path: Path) -> str:
         raise PipelineError(f"Cannot hash input {path}: {exc}") from exc
 
 
+def _code_hash(repo_root: Path) -> str:
+    """Fingerprint runnable source so old stage outputs cannot mask code edits."""
+    digest = hashlib.sha256()
+    code_files = [
+        *Path(repo_root, "src/flood_ml").rglob("*.py"),
+        *Path(repo_root, "scripts").rglob("*.py"),
+    ]
+    code_files.extend(
+        path
+        for path in (
+            Path(repo_root, ".python-version"),
+            Path(repo_root, "pyproject.toml"),
+        )
+        if path.is_file()
+    )
+    for path in sorted(set(code_files)):
+        if not path.is_file():
+            continue
+        try:
+            digest.update(path.relative_to(repo_root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        except OSError as exc:
+            raise PipelineError(f"Cannot fingerprint code file {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
 def _snapshot(value):
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
         return {key: _snapshot(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_snapshot(item) for item in value]
     return value
 
@@ -131,9 +159,38 @@ def start_run(settings: Settings, run_id: str) -> RunContext:
         asset["path"]: _hash_file(resolve_input(raw_root, asset["path"]))
         for asset in settings.sources["assets"]
     }
+    manifest_path = (
+        resolve_output(root, settings.sources["manifest"])
+        if settings.sources.get("manifest")
+        else None
+    )
+    # Standalone legacy stage CLIs can be exercised with isolated raw fixtures
+    # that intentionally omit a manifest. A full pipeline still requires and
+    # validates it before processing; when present, its metadata bytes are part
+    # of the run fingerprint.
+    manifest_hash = (
+        _hash_file(manifest_path)
+        if manifest_path is not None and manifest_path.is_file()
+        else None
+    )
+    configuration_hashes = {str(p): _hash_file(p) for p in settings.configuration_paths}
+    review_hashes = {
+        key: _hash_file(resolve_output(root, settings.labeling[key]))
+        for key in ("match_reviews", "event_reviews")
+        if settings.labeling.get(key)
+    }
     lock_hash = _hash_file(resolve_output(root, "uv.lock"))
+    code_hash = _code_hash(root)
     fingerprint = _hash_json(
-        {"config_hash": config_hash, "lock_sha256": lock_hash, "input_hashes": inputs}
+        {
+            "config_hash": config_hash,
+            "lock_sha256": lock_hash,
+            "input_hashes": inputs,
+            "manifest_sha256": manifest_hash,
+            "configuration_hashes": configuration_hashes,
+            "review_hashes": review_hashes,
+            "code_sha256": code_hash,
+        }
     )
     dirs = {}
     for name, base in settings.experiments["outputs"].items():
@@ -150,6 +207,9 @@ def start_run(settings: Settings, run_id: str) -> RunContext:
     )
     manifest_path = context.reports_dir / "run.json"
     lock_path = context.reports_dir / ".start.lock"
+    from flood_ml.utils.publication import preflight, run_destinations
+
+    preflight(settings, [manifest_path, lock_path, *run_destinations(settings, run_id)])
     owns_lock = False
     try:
         context.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -184,6 +244,10 @@ def start_run(settings: Settings, run_id: str) -> RunContext:
                         "git": _git_state(root),
                         "lock_sha256": lock_hash,
                         "input_hashes": inputs,
+                        "manifest_sha256": manifest_hash,
+                        "configuration_hashes": configuration_hashes,
+                        "review_hashes": review_hashes,
+                        "code_sha256": code_hash,
                     },
                 )
     except FileExistsError as exc:

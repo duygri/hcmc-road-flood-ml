@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 from dataclasses import replace
@@ -16,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from flood_ml.config import PipelineError, load_settings, resolve_input, resolve_output
 from flood_ml.gis.study_area import select_aoi
+from flood_ml.labeling.ird import read_ird
 from flood_ml.labeling.matching import match_candidates
 from flood_ml.labeling.observations import normalize_observations, propose_event_groups
 from flood_ml.labeling.reviews import (
@@ -27,42 +27,7 @@ from flood_ml.labeling.reviews import (
 from flood_ml.utils.run import _hash_file, start_run, write_json_atomic
 
 
-def read_ird(path):
-    """Preserve original Date text; join raw attributes to geometry by OBJECTID/fid.
-
-    Native Obs_id is not a record key (the current source repeats Obs_239).
-    Reject partial/ambiguous joins rather than silently dropping source rows.
-    """
-    path = Path(path).resolve()
-    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as connection:
-        attrs = pd.read_sql_query("SELECT * FROM Flood_event_locations", connection)
-        geometry_column = connection.execute(
-            "SELECT column_name FROM gpkg_geometry_columns WHERE table_name = 'Flood_event_locations'"
-        ).fetchone()[0]
-    attrs = attrs.drop(columns=[geometry_column])
-    geometry = gpd.read_file(
-        path, layer="Flood_event_locations", columns=[], fid_as_index=True
-    ).reset_index()
-    if (
-        "OBJECTID" not in attrs
-        or attrs.OBJECTID.isna().any()
-        or attrs.OBJECTID.duplicated().any()
-        or set(attrs.OBJECTID) != set(geometry.fid)
-    ):
-        raise PipelineError(
-            "IRD OBJECTID/fid requires complete one-to-one geometry join"
-        )
-    raw = gpd.GeoDataFrame(
-        attrs.merge(
-            geometry, left_on="OBJECTID", right_on="fid", validate="one_to_one"
-        ),
-        crs=geometry.crs,
-    )
-    raw["observation_id"] = "ird:flood_observations:fid:" + raw.OBJECTID.astype(str)
-    return raw
-
-
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/labeling.yaml"))
     parser.add_argument(
@@ -93,11 +58,18 @@ def main(argv=None):
             inputs["event_reviews"] = args.event_reviews
         paths = {k: resolve_output(settings.repo_root, v) for k, v in inputs.items()}
         hashes = {k: _hash_file(v) for k, v in paths.items()}
+        labeling = dict(
+            settings.labeling,
+            review_inputs=inputs,
+            review_input_hashes=hashes,
+        )
+        if args.match_reviews:
+            labeling["match_reviews"] = args.match_reviews
+        if args.event_reviews:
+            labeling["event_reviews"] = args.event_reviews
         settings = replace(
             settings,
-            labeling=dict(
-                settings.labeling, review_inputs=inputs, review_input_hashes=hashes
-            ),
+            labeling=labeling,
             experiments=dict(
                 settings.experiments,
                 run_id=args.run_id or settings.experiments["run_id"],
@@ -106,24 +78,35 @@ def main(argv=None):
         run = start_run(settings, settings.experiments["run_id"])
         write_json_atomic(run.reports_dir / "labels_qc.json", {"status": "started"})
         assets = settings.sources["assets"]
+        manifest_path = resolve_output(settings.repo_root, settings.sources["manifest"])
+        if manifest_path.is_file():
+            from flood_ml.pipeline import run_pipeline
 
-        def asset(asset_id):
-            chosen = [a for a in assets if a["asset_id"] == asset_id]
-            if len(chosen) != 1:
-                raise PipelineError(f"Exactly one {asset_id} asset required")
-            return resolve_input(settings.sources["raw_root"], chosen[0]["path"])
+            run_pipeline(settings, run, stages=["observations"])
+            observations = gpd.read_file(run.interim_dir / "flood_observations.gpkg")
+            groups = pd.read_parquet(
+                run.processed_dir / "unconfirmed_candidate_groups.parquet"
+            )
+        else:
+            # Legacy offline CLI fixtures can omit the manifest. Production runs
+            # with the tracked manifest share the orchestrated AOI/observation stage.
+            def asset(asset_id):
+                chosen = [a for a in assets if a["asset_id"] == asset_id]
+                if len(chosen) != 1:
+                    raise PipelineError(f"Exactly one {asset_id} asset required")
+                return resolve_input(settings.sources["raw_root"], chosen[0]["path"])
 
-        selector = settings.study_area["boundary_selection"]
-        aoi = select_aoi(
-            gpd.read_file(asset("administrative_boundaries")),
-            field=selector["field"],
-            value=selector["value"],
-            target_crs=settings.study_area["target_crs"],
-        )
-        observations = normalize_observations(
-            read_ird(asset("flood_observations")), aoi
-        )
-        groups = propose_event_groups(observations, settings.labeling)
+            selector = settings.study_area["boundary_selection"]
+            aoi = select_aoi(
+                gpd.read_file(asset("administrative_boundaries")),
+                field=selector["field"],
+                value=selector["value"],
+                target_crs=settings.study_area["target_crs"],
+            )
+            observations = normalize_observations(
+                read_ird(asset("flood_observations")), aoi
+            )
+            groups = propose_event_groups(observations, settings.labeling)
         roads = (
             gpd.read_parquet(paths["roads"])
             if paths["roads"].suffix == ".parquet"
@@ -197,14 +180,7 @@ def main(argv=None):
         write_json_atomic(run.reports_dir / "labels_qc.json", qc)
         print(json.dumps(qc, indent=2))
         return 0
-    except (
-        PipelineError,
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        sqlite3.Error,
-    ) as exc:
+    except (PipelineError, OSError, ValueError, KeyError, TypeError) as exc:
         if run:
             write_json_atomic(
                 run.reports_dir / "labels_qc.json",

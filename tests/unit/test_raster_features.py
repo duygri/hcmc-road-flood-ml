@@ -272,6 +272,42 @@ def test_order_and_values_are_independent_of_callers_chunks(flat_raster_case):
     pd.testing.assert_frame_equal(combined, pd.concat(chunks, ignore_index=True))
 
 
+def test_target_tiles_preserve_per_road_values_at_tile_boundary_and_nodata(
+    tmp_path, monkeypatch
+):
+    """A shared warped tile must be numerically identical to road windows."""
+    from flood_ml.features import raster as raster_module
+
+    case = factory.raster_case(tmp_path)
+    dem = np.tile(np.arange(120, dtype="float32"), (120, 1))
+    dem[:, :20] = -9999
+    cover = np.full((360, 360), 10, dtype="uint8")
+    cover[:, :60] = 0
+    case.update(
+        roads=gpd.GeoDataFrame(
+            {"road_segment_id": ["left", "edge_w", "edge_e"]},
+            geometry=[
+                LineString([(1300, 1125), (1300, 1275)]),
+                LineString([(1990, 1125), (1990, 1275)]),
+                LineString([(2010, 1125), (2010, 1275)]),
+            ],
+            crs=9210,
+        ),
+        aoi=gpd.GeoDataFrame(geometry=[box(900, 900, 2100, 1500)], crs=9210),
+        dem_paths=[factory.write_raster(tmp_path / "wide_dem.tif", dem)],
+        landcover_path=factory.write_raster(
+            tmp_path / "wide_lc.tif", cover, resolution=10, nodata=0
+        ),
+    )
+    # One-metre groups force the previous one-warp-per-road execution shape.
+    monkeypatch.setattr(raster_module, "RASTER_TILE_SIZE_M", 1)
+    per_road = raster_module.compute_raster_features(**case)
+    monkeypatch.setattr(raster_module, "RASTER_TILE_SIZE_M", 2000)
+    tiled = raster_module.compute_raster_features(**case)
+    pd.testing.assert_frame_equal(tiled, per_road, check_exact=True)
+    assert list(tiled.road_segment_id) == ["left", "edge_w", "edge_e"]
+
+
 def test_empty_roads_return_complete_schema(flat_raster_case):
     flat_raster_case["roads"] = flat_raster_case["roads"].iloc[:0]
     result = compute(**flat_raster_case)

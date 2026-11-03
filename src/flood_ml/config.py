@@ -21,6 +21,7 @@ class Settings:
     labeling: dict
     experiments: dict
     seed: int
+    configuration_paths: tuple[Path, ...] = ()
 
 
 def _relative_path(root: Path, value: str) -> Path:
@@ -147,6 +148,22 @@ def load_settings(config_path: Path, *, repo_root: Path) -> Settings:
     local = resolve_output(repo_root, "configs/local/sources.yaml")
     if local.exists():
         sources.update(_read_section(local, "sources"))
+    labeling = loaded["labeling"]
+    for review_key, template_key in (
+        ("match_reviews", "match_reviews_template"),
+        ("event_reviews", "event_reviews_template"),
+    ):
+        template = labeling.get(template_key)
+        if (
+            not labeling.get(review_key)
+            and isinstance(template, str)
+            and template.strip()
+        ):
+            candidate = resolve_output(repo_root, template)
+            if candidate.is_file():
+                # The local header-only files are the editable review inputs.
+                # Their content hash then participates in the run fingerprint.
+                labeling[review_key] = template
     raw_value = sources.get("raw_root")
     if not isinstance(raw_value, str) or not raw_value.strip():
         raise PipelineError("sources.raw_root must be a nonempty path string")
@@ -194,4 +211,17 @@ def load_settings(config_path: Path, *, repo_root: Path) -> Settings:
     if loaded["labeling"].get("positive_requires_review") is not True:
         raise PipelineError("labeling.positive_requires_review must be boolean true")
     sources["raw_root"] = raw_root
-    return Settings(repo_root=repo_root, **loaded, experiments=experiments, seed=seed)
+    configuration_paths = {
+        selected,
+        experiments_path,
+        *(resolve_output(repo_root, value) for value in links.values()),
+    }
+    if local.exists():
+        configuration_paths.add(local)
+    return Settings(
+        repo_root=repo_root,
+        **loaded,
+        experiments=experiments,
+        seed=seed,
+        configuration_paths=tuple(sorted(configuration_paths)),
+    )

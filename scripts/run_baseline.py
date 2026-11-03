@@ -120,7 +120,7 @@ def _preflight_publications(settings, run_id, inputs):
     return publications
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/experiments.yaml"))
     parser.add_argument(

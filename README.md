@@ -1,86 +1,106 @@
 # HCMC road flood susceptibility research
 
-Pipeline nghiên cứu **mức độ dễ ngập tương đối** của đoạn đường trong TP.HCM
-trước mở rộng địa giới 2025. Mốc hiện tại chỉ thiết lập môi trường, cấu hình và
-run provenance. Các CLI xử lý GIS và MCDA sẽ được bổ sung theo kế hoạch đã duyệt.
-Score MCDA không phải xác suất ngập và không dự báo thời điểm ngập.
+This repository builds a reproducible, reviewable baseline for relative flood
+susceptibility of road segments inside pre-2025 Ho Chi Minh City. It retains
+unreviewed flood reports as unknown evidence and does not interpret them as
+verified negatives. MCDA scores are relative indices, not flood probabilities
+or forecasts. The current milestone is a complete baseline pipeline; evaluation
+stays pending until its independent human review quotas are met.
 
-## Windows / PowerShell
+## Windows setup
 
-Cài [uv bằng installer chính thức](https://docs.astral.sh/uv/getting-started/installation/)
-nếu chưa có, sau đó mở PowerShell tại thư mục repo:
+Install `uv`, then open PowerShell at the repository root:
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-# Nếu terminal hiện tại chưa nhận PATH mới:
-$env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
-# Python riêng của repo; không thay Python hệ thống.
-$env:UV_PYTHON_INSTALL_DIR = Join-Path $PWD '.uv-python'
 uv python install 3.12
 uv sync --locked --group dev
-uv run python --version
-uv lock --check
-uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
+uv run pytest -q
 ```
 
-Repo yêu cầu Python >=3.11, pin nhánh 3.12 bằng `.python-version`, tạo `.venv`
-riêng và khóa dependency trong `uv.lock`. Chưa cài XGBoost. Không cần GPU.
+Python 3.12 and the dependency lock are pinned for reproducible runs. Commands
+and tests work offline after dependencies and research data are present. CI uses
+synthetic fixtures only and does not download research data.
 
-## Cấu hình và dữ liệu local
+## Configure local source paths
 
-`configs/experiments.yaml` là nơi duy nhất khai báo seed/run_id và liên kết bốn
-section còn lại. Mọi path cấu hình tương đối được giải theo `repo_root`, độc lập
-với working directory. Có thể vào `load_settings` qua bất kỳ file nào trong năm
-file YAML; tất cả cùng đọc bundle và seed đó. Mỗi file có một mapping theo tên
-section (`sources`, `study_area`, `features`, `labeling`, `experiments`).
-
-Mặc định `sources.raw_root: data/raw`. Để đọc dữ liệu đã tải từ một thư mục khác,
-tạo `configs/local/sources.yaml` (được Git ignore), dùng path tuyệt đối riêng máy:
+`configs/experiments.yaml` links the shared configuration sections and owns the
+run ID, seed, output roots, split, MCDA and evaluation rules. Configured paths
+resolve from the repository root, independent of the current working directory.
+The tracked default reads `data/raw`. To use the downloaded raw files outside
+the checkout, edit the ignored `configs/local/sources.yaml`:
 
 ```yaml
 sources:
-  raw_root: 'E:/research-data/raw'
+  raw_root: 'D:/hcmc-road-flood-ml/data/raw'
 ```
 
-Local override chỉ overlay các khóa trong section sources. Không ghi path máy
-cá nhân vào config tracked. Task 2 sẽ thêm source inventory vào `sources.assets`;
-danh sách hiện rỗng có chủ đích, không có nghĩa nguồn đã được xác thực.
+The local path and human review CSVs are never committed. Raw source binaries
+are read-only; the pipeline validates the manifest and every configured checksum
+before processing.
 
-Raw được đọc qua `resolve_input(raw_root, asset_path)`, không tạo/copy/sửa file
-nguồn. `resolve_output(repo_root, relative_path)` từ chối path tuyệt đối, traversal
-và symlink/junction thoát root. Output config không được chồng raw root. Các caller
-phải dùng resolver đúng vai trò; resolver trả `Path`, không phải sandbox của OS.
+## Run the full pipeline
 
-Output mỗi run ở `data/interim/<run_id>/`, `data/processed/<run_id>/`,
-`reports/runs/<run_id>/`, `artifacts/<run_id>/`. Raw binaries và output local
-không đưa vào Git. Các metadata nguồn hiện có chưa được migrate ở Task 1.
-
-## Run provenance
-
-```python
-from pathlib import Path
-from flood_ml.config import load_settings
-from flood_ml.utils.run import start_run
-
-root = Path.cwd()  # truyền root repo rõ ràng nếu chạy từ thư mục khác
-settings = load_settings(Path('configs/experiments.yaml'), repo_root=root)
-context = start_run(settings, settings.experiments['run_id'])
+```powershell
+uv run python scripts/run_pipeline.py --config configs/experiments.yaml --run-id hcmc_old_v1_001
 ```
 
-`reports/runs/<run_id>/run.json` chứa snapshot cấu hình, seed, thời gian UTC,
-git commit/dirty state, SHA-256 lock và SHA-256 của từng input asset cấu hình.
-Không scan raw root tự động. Run ID cũ chỉ reuse khi fingerprint cấu hình, inputs
-và lock không đổi; nếu thay đổi phải chọn ID mới. Git state lưu tại lúc khởi tạo.
-Chưa có Git metadata thì ghi null rõ ràng.
+Each run writes under its own folders:
 
-Run record có `status: started`, **không** phải completion marker. Atomic JSON
-ghi temp cùng thư mục, flush/fsync và replace; lỗi không xuất file dở và giữ file
-cũ nguyên vẹn. Khởi tạo đồng thời cùng run ID bị từ chối qua lock độc quyền;
-nếu process bị kill và để `.start.lock`, cần kiểm tra không còn process sử dụng
-run trước khi bỏ stale lock. Stage checkpoints và completion sẽ thuộc Task 12.
+- `data/interim/<run_id>/`: AOI, OSM road segments, normalized observations,
+  and raster/water intermediate features.
+- `data/processed/<run_id>/`: road features, nullable labels, review links,
+  spatial partitions, analysis dataset and susceptibility scores.
+- `reports/runs/<run_id>/`: source/stage audits, offline report, sensitivity,
+  evaluation gate and completion record.
+- `artifacts/<run_id>/`: normalization rules and offline maps.
 
-Nguồn và giới hạn giấy phép được mô tả trong [SPEC](SPEC.md) và
-[thiết kế đã duyệt](docs/superpowers/specs/2026-11-02-old-hcmc-baseline-design.md).
-IRD/FABDEM có điều kiện phi thương mại; OSM cần attribution và tuân thủ ODbL.
+The completion record is written only after every required output is present
+and hashed. Stage outputs are reused only when their run fingerprint, dependency
+hashes and output hashes still match. A changed input requires a new `--run-id`;
+modified outputs are rebuilt with their dependent stages.
+
+You can run only selected stages and their prerequisites:
+
+```powershell
+uv run python scripts/run_pipeline.py --config configs/experiments.yaml --run-id hcmc_old_v1_002 --stage observations
+```
+
+To prepare normalized observations separately:
+
+```powershell
+uv run python scripts/prepare_observations.py --config configs/labeling.yaml --run-id hcmc_old_v1_003
+```
+
+## Human review
+
+The local review files are header-only templates:
+
+- `configs/local/review_decisions.csv`: observation-to-road decisions.
+- `configs/local/event_reviews.csv`: event and location group memberships,
+  plus `affected_geometry_complete`.
+
+Only the explicit `accepted` decision creates a positive road label, and it
+requires both match and event review. Blank completeness values mean false.
+Setting `affected_geometry_complete=true` attests that the accepted full road
+segments form the entire affected extent. Candidate matches are never labels.
+Review instructions and the meaning of partial geometry are documented in
+[`docs/methodology.md`](docs/methodology.md).
+
+The pipeline can produce a baseline while those files are empty. In that state
+`road_labels.label_binary` remains null and `evaluation_status` is
+`pending_label_review`; no capture metrics are presented as completed.
+
+## Research limits and data use
+
+The data, model and reproducibility cards describe source vintages, spatial
+resolution, media bias, coverage assumptions, unknown labels and license terms.
+IRD and FABDEM have noncommercial restrictions in the current inventory; OSM
+requires attribution and ODbL handling. Review source conditions before sharing
+derived products.
+
+See [SPEC.md](SPEC.md) for the approved analysis contract,
+[`docs/methodology.md`](docs/methodology.md) for the processing choices,
+[`docs/data_card.md`](docs/data_card.md), [`docs/model_card.md`](docs/model_card.md),
+and [`docs/reproducibility.md`](docs/reproducibility.md) for run evidence.

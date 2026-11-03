@@ -43,6 +43,9 @@ TARGET_CRS = "EPSG:9210"
 DEM_RESOLUTION = 30
 LANDCOVER_RESOLUTION = 10
 VEGETATION_CLASSES = (10, 20, 30, 40, 90, 95, 100)
+# Performance-only execution detail.  The public feature schema remains
+# unchanged, and every road is sampled from its original snapped window.
+RASTER_TILE_SIZE_M = 2000
 
 
 def _grid(bounds, resolution):
@@ -159,6 +162,48 @@ def _warp_window(sources, bounds, resolution, resampling):
     return values, target_transform
 
 
+def _window_from_tile(values, tile_transform, bounds, resolution):
+    """Return the snapped subwindow used by the legacy per-road extraction.
+
+    A tile is warped onto the same globally snapped grid as an individual
+    road window.  Taking this slice therefore retains the exact pixel centres
+    and resampled values, while avoiding a source merge and reprojection for
+    every road in a densely populated tile.
+    """
+    transform, shape = _grid(bounds, resolution)
+    col = round((transform.c - tile_transform.c) / resolution)
+    row = round((tile_transform.f - transform.f) / resolution)
+    if (
+        abs((transform.c - tile_transform.c) / resolution - col) > 1e-8
+        or abs((tile_transform.f - transform.f) / resolution - row) > 1e-8
+        or row < 0
+        or col < 0
+        or row + shape[0] > values.shape[0]
+        or col + shape[1] > values.shape[1]
+    ):
+        raise PipelineError("Raster tile does not contain a requested road window")
+    return values[row : row + shape[0], col : col + shape[1]], transform
+
+
+def _tile_groups(roads, tile_size_m):
+    """Group input positions into bounded target-CRS tiles, preserving order."""
+    centres = roads.geometry.centroid
+    groups = {}
+    for position, point in enumerate(centres):
+        key = (math.floor(point.x / tile_size_m), math.floor(point.y / tile_size_m))
+        groups.setdefault(key, []).append(position)
+    return groups.values()
+
+
+def _expanded_bounds(bounds, distance):
+    return (
+        bounds[0] - distance,
+        bounds[1] - distance,
+        bounds[2] + distance,
+        bounds[3] + distance,
+    )
+
+
 def _slope(dem):
     """Horn's 3x3 derivatives; every stencil cell must have a valid height."""
     windows = np.lib.stride_tricks.sliding_window_view(dem, (3, 3))
@@ -261,6 +306,7 @@ def compute_raster_features(
     threshold = _number(config, "min_valid_fraction", 0.9, allow_zero=True)
     if threshold > 1:
         raise PipelineError("min_valid_fraction must be in [0, 1]")
+    tile_size_m = RASTER_TILE_SIZE_M
     halo = context_radius_m(
         dict(config, **buffers), raster_stencil_m=math.sqrt(2) * DEM_RESOLUTION
     )
@@ -274,8 +320,12 @@ def compute_raster_features(
         "height_units": "metres assumed; no vertical transformation",
         "slope_method": "Horn 3x3; all nine cells valid; metres",
         "buffers_m": buffers,
+        "execution": {
+            "tile_size_m": tile_size_m,
+            "sampling": "per-road snapped subwindows from target-space tiles",
+        },
     }
-    rows, sampled_classes = [], set()
+    rows, sampled_classes = [None] * len(roads), set()
     try:
         with ExitStack() as stack:
             # Bound GDAL's shared block cache; never read an entire source band.
@@ -298,54 +348,84 @@ def compute_raster_features(
                     "resampling": resampling,
                     "sources": [_source_metadata(source) for source in sources],
                 }
-            for road_id, geometry in zip(roads.road_segment_id, roads.geometry):
-                local = geometry.buffer(buffers["dem_buffer_m"])
-                neighborhood = geometry.buffer(buffers["neighborhood_radius_m"])
-                dem_bounds = (
-                    local.union(neighborhood)
-                    .buffer(math.sqrt(2) * DEM_RESOLUTION)
-                    .bounds
+            # Segment lengths are bounded by the road stage.  The tile window
+            # expands by the largest road reach, so every per-road legacy
+            # window (including bilinear/slope support) is an interior slice.
+            dem_reach = (
+                max(buffers["dem_buffer_m"], buffers["neighborhood_radius_m"])
+                + math.sqrt(2) * DEM_RESOLUTION
+            )
+            for positions in _tile_groups(roads, tile_size_m):
+                group = roads.iloc[positions]
+                minx, miny, maxx, maxy = group.total_bounds
+                dem_tile, dem_transform = _warp_window(
+                    dem_sources,
+                    _expanded_bounds((minx, miny, maxx, maxy), dem_reach),
+                    DEM_RESOLUTION,
+                    Resampling.bilinear,
                 )
-                dem, dt = _warp_window(
-                    dem_sources, dem_bounds, DEM_RESOLUTION, Resampling.bilinear
-                )
-                heights, local_fraction = _sample(dem, dt, local)
-                nearby, nearby_fraction = _sample(dem, dt, neighborhood)
-                slopes, slope_fraction = _sample(_slope(dem), dt, local)
-                cover = geometry.buffer(buffers["landcover_buffer_m"])
-                lc, lt = _warp_window(
-                    lc_sources, cover.bounds, LANDCOVER_RESOLUTION, Resampling.nearest
-                )
-                classes, cover_fraction = _sample(lc, lt, cover)
-                sampled_classes.update(np.unique(classes).tolist())
-                relative_fraction = min(local_fraction, nearby_fraction)
-                fractions = (
-                    local_fraction,
-                    local_fraction,
-                    relative_fraction,
-                    slope_fraction,
-                    cover_fraction,
-                    cover_fraction,
-                )
-                statistics = (
-                    lambda values=heights: np.median(values),
-                    lambda values=heights: np.percentile(values, 10),
-                    lambda values=heights, context_values=nearby: (
-                        np.median(values) - np.median(context_values)
+                lc_tile, lc_transform = _warp_window(
+                    lc_sources,
+                    _expanded_bounds(
+                        (minx, miny, maxx, maxy), buffers["landcover_buffer_m"]
                     ),
-                    lambda values=slopes: np.mean(values),
-                    lambda values=classes: np.mean(values == 50),
-                    lambda values=classes: np.mean(np.isin(values, VEGETATION_CLASSES)),
+                    LANDCOVER_RESOLUTION,
+                    Resampling.nearest,
                 )
-                row = {"road_segment_id": road_id}
-                for name, fraction, statistic in zip(FEATURES, fractions, statistics):
-                    row[name] = (
-                        float(statistic())
-                        if fraction > 0 and fraction >= threshold
-                        else np.nan
+                for position in positions:
+                    road_id = roads.road_segment_id.iloc[position]
+                    geometry = roads.geometry.iloc[position]
+                    local = geometry.buffer(buffers["dem_buffer_m"])
+                    neighborhood = geometry.buffer(buffers["neighborhood_radius_m"])
+                    dem_bounds = (
+                        local.union(neighborhood)
+                        .buffer(math.sqrt(2) * DEM_RESOLUTION)
+                        .bounds
                     )
-                    row[f"{name}_valid_fraction"] = fraction
-                rows.append(row)
+                    dem, dt = _window_from_tile(
+                        dem_tile, dem_transform, dem_bounds, DEM_RESOLUTION
+                    )
+                    heights, local_fraction = _sample(dem, dt, local)
+                    nearby, nearby_fraction = _sample(dem, dt, neighborhood)
+                    slopes, slope_fraction = _sample(_slope(dem), dt, local)
+                    cover = geometry.buffer(buffers["landcover_buffer_m"])
+                    lc, lt = _window_from_tile(
+                        lc_tile, lc_transform, cover.bounds, LANDCOVER_RESOLUTION
+                    )
+                    classes, cover_fraction = _sample(lc, lt, cover)
+                    sampled_classes.update(np.unique(classes).tolist())
+                    relative_fraction = min(local_fraction, nearby_fraction)
+                    fractions = (
+                        local_fraction,
+                        local_fraction,
+                        relative_fraction,
+                        slope_fraction,
+                        cover_fraction,
+                        cover_fraction,
+                    )
+                    statistics = (
+                        lambda values=heights: np.median(values),
+                        lambda values=heights: np.percentile(values, 10),
+                        lambda values=heights, context_values=nearby: (
+                            np.median(values) - np.median(context_values)
+                        ),
+                        lambda values=slopes: np.mean(values),
+                        lambda values=classes: np.mean(values == 50),
+                        lambda values=classes: np.mean(
+                            np.isin(values, VEGETATION_CLASSES)
+                        ),
+                    )
+                    row = {"road_segment_id": road_id}
+                    for name, fraction, statistic in zip(
+                        FEATURES, fractions, statistics
+                    ):
+                        row[name] = (
+                            float(statistic())
+                            if fraction > 0 and fraction >= threshold
+                            else np.nan
+                        )
+                        row[f"{name}_valid_fraction"] = fraction
+                    rows[position] = row
     except (rasterio.errors.RasterioError, OSError) as exc:
         raise PipelineError(f"Cannot extract raster features: {exc}") from exc
     metadata["landcover"]["sampled_classes"] = sorted(sampled_classes)

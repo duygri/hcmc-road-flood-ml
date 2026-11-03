@@ -83,7 +83,7 @@ def _peak_memory_bytes():
     return int(peak if sys.platform == "darwin" else peak * 1024)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/study_area.yaml"))
     parser.add_argument(

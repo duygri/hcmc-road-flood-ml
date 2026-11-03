@@ -21,7 +21,7 @@ from flood_ml.gis.study_area import select_aoi
 from flood_ml.utils.run import _hash_file, start_run, write_json_atomic
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/features.yaml"))
     parser.add_argument(
@@ -47,6 +47,11 @@ def main(argv=None):
             key: resolve_output(settings.repo_root, value)
             for key, value in inputs.items()
         }
+        missing = [name for name, path in paths.items() if not path.is_file()]
+        if missing:
+            raise PipelineError(
+                f"Missing {', '.join(missing)} prerequisite; run scripts/run_pipeline.py first"
+            )
         input_hashes = {key: _hash_file(path) for key, path in paths.items()}
         settings = replace(
             settings,

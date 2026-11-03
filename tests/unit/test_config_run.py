@@ -268,6 +268,18 @@ def test_run_id_lock_change_rejected(repo):
         start_run(settings, "fixture_001")
 
 
+def test_run_id_source_code_change_rejected(repo):
+    source = repo / "src/flood_ml"
+    source.mkdir(parents=True)
+    module = source / "stage.py"
+    module.write_text("VALUE = 1\n", encoding="utf-8")
+    settings = load_settings(Path("configs/experiments.yaml"), repo_root=repo)
+    start_run(settings, "fixture_001")
+    module.write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(PipelineError, match="fingerprint"):
+        start_run(settings, "fixture_001")
+
+
 def test_run_id_input_change_rejected(repo):
     raw = repo / "data/raw"
     raw.mkdir(parents=True)

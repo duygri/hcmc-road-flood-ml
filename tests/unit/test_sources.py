@@ -52,6 +52,33 @@ def audit_path(settings):
     return settings.repo_root / "reports/audit_001/source_audit.json"
 
 
+@pytest.mark.parametrize("hardlink", [False, True])
+def test_audit_alias_cannot_overwrite_manifest_on_failure(configured_sources, hardlink):
+    settings = configured_sources
+    manifest = settings.repo_root / "manifest.yaml"
+    destination = audit_path(settings)
+    destination.parent.mkdir(parents=True)
+    if hardlink:
+        import os
+
+        os.link(manifest, destination)
+    else:
+        destination.write_bytes(manifest.read_bytes())
+        settings = replace(
+            settings,
+            sources=dict(
+                settings.sources,
+                manifest=str(destination.relative_to(settings.repo_root)),
+            ),
+        )
+        manifest = destination
+    before = manifest.read_bytes()
+    (settings.sources["raw_root"] / "abc.bin").unlink()
+    with pytest.raises(PipelineError):
+        validate_sources(settings)
+    assert manifest.read_bytes() == before
+
+
 def test_published_checksum_is_validated(configured_sources):
     audit = validate_sources(configured_sources)
     assert audit["status"].tolist() == ["PASS"]

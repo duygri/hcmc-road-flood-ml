@@ -134,6 +134,9 @@ def _audit_path(settings: Settings) -> Path:
     raw = Path(settings.sources["raw_root"]).resolve()
     if path.is_relative_to(raw) or raw.is_relative_to(path.parent):
         raise PipelineError("Source audit must not overlap raw_root")
+    from flood_ml.utils.publication import preflight
+
+    preflight(settings, [path])
     return path
 
 

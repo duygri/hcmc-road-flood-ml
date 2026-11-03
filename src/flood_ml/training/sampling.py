@@ -21,6 +21,7 @@ FEATURE_COLUMNS = [
 DEFAULT_PRIMARY_RATIO = 10
 DEFAULT_SENSITIVITY_RATIOS = (5, 20)
 DEFAULT_SEEDS = tuple(range(42, 62))
+ROAD_REVIEW_FIELDS = ("evidence", "reviewed_by", "reviewed_at")
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,16 @@ class SamplingResult:
 
 def _valid_text(value):
     return isinstance(value, str) and bool(value.strip())
+
+
+def _road_link_reviewed(row):
+    if not all(_valid_text(row.get(key)) for key in ROAD_REVIEW_FIELDS):
+        return False
+    try:
+        stamp = pd.Timestamp(row["reviewed_at"])
+        return not pd.isna(stamp) and stamp.tzinfo is not None
+    except (ValueError, TypeError, OverflowError):
+        return False
 
 
 def _settings(config):
@@ -86,6 +97,20 @@ def _validate_inputs(features, labels, events, partitions):
         require_ids(frame, KEY)
         if frame.columns.duplicated().any():
             raise PipelineError(f"{name} columns must be unique")
+    if not isinstance(events, pd.DataFrame) or events.columns.duplicated().any():
+        raise PipelineError(
+            "Confirmed event segments must be a table with distinct columns"
+        )
+    event_keys = (KEY, "event_group_id", "location_group_id")
+    if any(
+        key not in events
+        or events[key].isna().any()
+        or not events[key].map(_valid_text).all()
+        for key in event_keys
+    ):
+        raise PipelineError(
+            "Confirmed event segments require nonblank road/event/location IDs"
+        )
     if not set(FEATURE_COLUMNS).issubset(features.columns):
         raise PipelineError("Feature table is missing approved Track B features")
     if (
@@ -153,15 +178,18 @@ def build_background_draws(
     )
     complete_ids &= structurally_eligible
 
-    # Gate assignments are independent, reviewed event groups. A group qualifies
-    # only when it contributes at least one complete-feature positive road.
+    # Event and road review are independent conditions for fit membership.
+    reviewed_road_ids = {
+        row[KEY]
+        for row in confirmed_event_segments.to_dict("records")
+        if _road_link_reviewed(row)
+    }
     eligible_events = []
-    positive_exclusions = []
     for assignment in gate["reviewed_events"]:
         group = confirmed_event_segments.loc[
             confirmed_event_segments.event_group_id.eq(assignment["event_group_id"])
         ]
-        candidates = sorted(set(group[KEY]) & complete_ids)
+        candidates = sorted(set(group[KEY]) & complete_ids & reviewed_road_ids)
         candidates = [
             rid
             for rid in candidates
@@ -170,31 +198,7 @@ def build_background_draws(
         ]
         if candidates:
             eligible_events.append(assignment["event_group_id"])
-        else:
-            group_positives = [
-                rid
-                for rid in set(group[KEY])
-                if label_map.get(rid) == "positive"
-                and part_map.loc[rid, "partition"] == "reference"
-            ]
-            positive_exclusions.extend(
-                {
-                    "event_group_id": assignment["event_group_id"],
-                    "road_segment_id": rid,
-                    "reason": "structurally_ineligible"
-                    if rid not in structurally_eligible
-                    else "incomplete_or_nonfinite_features"
-                    if rid not in complete_ids
-                    else "no_complete_feature_eligible_positive_road",
-                }
-                for rid in group_positives
-            )
-    gate = {
-        **gate,
-        "feature_eligible_reference_events": len(eligible_events),
-        "positive_exclusions": positive_exclusions,
-        "background_exclusions": [],
-    }
+    eligible_event_ids = set(eligible_events)
     unknown_ids = [
         rid
         for rid in features[KEY]
@@ -215,15 +219,53 @@ def build_background_draws(
     positive_ids = sorted(
         {
             rid
-            for event_id in eligible_events
+            for event_id in eligible_event_ids
             for rid in confirmed_event_segments.loc[
                 confirmed_event_segments.event_group_id.eq(event_id), KEY
             ]
             if rid in complete_ids
+            and rid in reviewed_road_ids
             and label_map.get(rid) == "positive"
             and part_map.loc[rid, "partition"] == "reference"
         }
     )
+    reference_positive_ids = {
+        rid
+        for rid in features[KEY]
+        if label_map.get(rid) == "positive"
+        and part_map.loc[rid, "partition"] == "reference"
+    }
+    event_ids_by_road = {}
+    for row in confirmed_event_segments.to_dict("records"):
+        event_ids_by_road.setdefault(row[KEY], set()).add(row["event_group_id"])
+    reviewed_event_ids = {row["event_group_id"] for row in gate["reviewed_events"]}
+    positive_exclusions = []
+    for rid in sorted(reference_positive_ids - set(positive_ids)):
+        associated_event_ids = sorted(event_ids_by_road.get(rid, set()))
+        if rid not in reviewed_road_ids:
+            reason = "road_review_incomplete"
+        elif rid not in structurally_eligible:
+            reason = "structurally_ineligible"
+        elif rid not in complete_ids:
+            reason = "incomplete_or_nonfinite_features"
+        elif not reviewed_event_ids.intersection(associated_event_ids):
+            reason = "event_not_review_eligible"
+        else:
+            reason = "no_complete_feature_eligible_positive_road"
+        positive_exclusions.append(
+            {
+                "event_group_id": associated_event_ids[0]
+                if associated_event_ids
+                else None,
+                "road_segment_id": rid,
+                "reason": reason,
+            }
+        )
+    gate = {
+        **gate,
+        "feature_eligible_reference_events": len(eligible_events),
+        "positive_exclusions": positive_exclusions,
+    }
     if len(eligible_events) < 20:
         return SamplingResult("pending_positive_review", gate, (), ())
 

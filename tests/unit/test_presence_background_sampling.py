@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
+import pytest
 
+from flood_ml.config import PipelineError
+from flood_ml.training import sampling
 from flood_ml.training.sampling import FEATURE_COLUMNS, build_background_draws
 
 
@@ -123,3 +126,78 @@ def test_small_background_pool_is_audited():
     assert result.status == "background_pool_insufficient"
     assert result.draws == ()
     assert result.failures
+
+
+def test_positive_road_membership_requires_its_own_review(monkeypatch):
+    args = list(case())
+    extra_id = "p0_unreviewed"
+    features, labels, events, partitions, _ = args
+    extra_feature = features.loc[features.road_segment_id.eq("p0")].copy()
+    extra_feature.loc[:, "road_segment_id"] = extra_id
+    args[0] = pd.concat([features, extra_feature], ignore_index=True)
+    args[1] = pd.concat(
+        [labels, pd.DataFrame([[extra_id, "positive"]], columns=labels.columns)],
+        ignore_index=True,
+    )
+    extra_event = events.loc[events.road_segment_id.eq("p0")].copy()
+    extra_event.loc[:, "road_segment_id"] = extra_id
+    extra_event.loc[:, "evidence"] = ""
+    args[2] = pd.concat([events, extra_event], ignore_index=True)
+    extra_partition = partitions.loc[partitions.road_segment_id.eq("p0")].copy()
+    extra_partition.loc[:, "road_segment_id"] = extra_id
+    args[3] = pd.concat([partitions, extra_partition], ignore_index=True)
+
+    # Isolate the sampler's per-road provenance guard from the event-level gate.
+    monkeypatch.setattr(
+        sampling,
+        "evaluation_gate",
+        lambda *_: {
+            "reviewed_events": [{"event_group_id": f"e{i}"} for i in range(20)]
+        },
+    )
+
+    result = build_background_draws(*args)
+    assert result.status == "ready"
+    for draw in result.draws:
+        positives = {road_id for road_id, y in zip(draw.road_ids, draw.y) if y == 1}
+        assert extra_id not in positives
+        assert positives == {f"p{i}" for i in range(20)}
+
+
+def test_each_excluded_positive_is_audited_when_its_event_has_an_eligible_positive():
+    args = list(case())
+    extra_id = "p0_structurally_ineligible"
+    features, labels, events, partitions, _ = args
+    extra_feature = features.loc[features.road_segment_id.eq("p0")].copy()
+    extra_feature.loc[:, "road_segment_id"] = extra_id
+    args[0] = pd.concat([features, extra_feature], ignore_index=True)
+    args[0]["score_eligible"] = True
+    args[0].loc[args[0].road_segment_id.eq(extra_id), "score_eligible"] = False
+    args[1] = pd.concat(
+        [labels, pd.DataFrame([[extra_id, "positive"]], columns=labels.columns)],
+        ignore_index=True,
+    )
+    extra_event = events.loc[events.road_segment_id.eq("p0")].copy()
+    extra_event.loc[:, "road_segment_id"] = extra_id
+    args[2] = pd.concat([events, extra_event], ignore_index=True)
+    extra_partition = partitions.loc[partitions.road_segment_id.eq("p0")].copy()
+    extra_partition.loc[:, "road_segment_id"] = extra_id
+    args[3] = pd.concat([partitions, extra_partition], ignore_index=True)
+
+    result = build_background_draws(*args)
+    assert result.status == "ready"
+    exclusion = next(
+        item
+        for item in result.gate["positive_exclusions"]
+        if item["road_segment_id"] == extra_id
+    )
+    assert exclusion["reason"] == "structurally_ineligible"
+    assert all(extra_id not in draw.road_ids for draw in result.draws)
+
+
+def test_confirmed_event_segments_schema_is_validated():
+    args = case()
+    malformed_events = args[2].drop(columns=["event_group_id"])
+
+    with pytest.raises(PipelineError, match="Confirmed event segments"):
+        sampling._validate_inputs(args[0], args[1], malformed_events, args[3])

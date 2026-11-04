@@ -6,6 +6,8 @@ proof. The caller must replay in a separate checkout before invoking this module
 
 import json
 import math
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import geopandas as gpd
@@ -131,6 +133,29 @@ def _compare_json(left, right, path, differences, atol, *, tolerant=True):
         differences.append(
             {"file": path, "check": "exact", "published": left, "local": right}
         )
+
+
+def _geopackage_schema(path: Path, layer: str) -> list[dict]:
+    """Read ordered declared layer columns, excluding SQLite/GPKG support tables.
+
+    Include the layer's declared FID/geometry columns consistently with its user
+    fields, but do not compare spatial indexes, SQLite internals, or row IDs.
+    Bound layer names as values so quoted/non-ASCII identifiers remain safe.
+    """
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+        columns = connection.execute(
+            'SELECT name, type, "notnull", pk FROM pragma_table_info(?) ORDER BY cid',
+            (layer,),
+        ).fetchall()
+    return [
+        {
+            "name": name,
+            "type": declared_type,
+            "not_null": bool(not_null),
+            "primary_key": primary_key,
+        }
+        for name, declared_type, not_null, primary_key in columns
+    ]
 
 
 def _keys(frame, name):
@@ -458,6 +483,17 @@ def compare_runs(
                 if layers_a.tolist() != layers_b.tolist():
                     differences.append({"file": relative, "check": "layers"})
                 for layer in set(layers_a[:, 0]) & set(layers_b[:, 0]):
+                    schema_a = _geopackage_schema(published, layer)
+                    schema_b = _geopackage_schema(local, layer)
+                    if schema_a != schema_b:
+                        differences.append(
+                            {
+                                "file": f"{relative}:{layer}",
+                                "check": "geopackage_schema",
+                                "published": schema_a,
+                                "local": schema_b,
+                            }
+                        )
                     _compare_frame(
                         gpd.read_file(published, layer=layer, engine="pyogrio"),
                         gpd.read_file(local, layer=layer, engine="pyogrio"),
@@ -477,7 +513,7 @@ def compare_runs(
                     differences,
                     atol,
                 )
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
             differences.append(
                 {
                     "file": relative,

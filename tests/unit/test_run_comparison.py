@@ -393,3 +393,46 @@ def test_compare_runs_requires_review_hashes_for_configured_review_inputs(runs):
     manifest_path.write_text(json.dumps(manifest))
     refresh(published)
     assert not compare_runs(published, local, RUN_ID)["equivalent"]
+
+
+@pytest.mark.parametrize("declaration", ["REAL NOT NULL", "DOUBLE"])
+def test_compare_runs_rejects_geopackage_declared_schema_changes_with_identical_values(
+    runs, declaration
+):
+    import sqlite3
+
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    published, local = runs
+    frame = gpd.GeoDataFrame(
+        {"road_segment_id": ["r1"], "feature": [1.0]},
+        geometry=[LineString([(0, 0), (1, 1)])],
+        crs="EPSG:32648",
+    )
+    add_table(published, local, "roads.gpkg", frame)
+    assert compare_runs(published, local, RUN_ID)["equivalent"]
+    local_path = local / f"data/processed/{RUN_ID}/roads.gpkg"
+    with sqlite3.connect(local_path) as connection:
+        # Change only the declared constraint; preserve layer registration,
+        # row values, geometry and spatial indexes without requiring GIS SQL extensions.
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'roads'"
+        ).fetchone()[0]
+        assert '"feature" REAL' in sql
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'roads'",
+            (sql.replace('"feature" REAL', f'"feature" {declaration}'),),
+        )
+        version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute(f"PRAGMA schema_version={version + 1}")
+        connection.execute("PRAGMA writable_schema=OFF")
+    assert gpd.read_file(local_path, layer="roads").equals(frame)
+    report = compare_runs(published, local, RUN_ID)
+    assert not report["equivalent"]
+    difference = next(
+        d for d in report["differences"] if d["check"] == "geopackage_schema"
+    )
+    assert difference["file"].endswith("roads.gpkg:roads")
+    assert difference["published"] != difference["local"]

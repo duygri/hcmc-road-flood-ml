@@ -74,6 +74,59 @@ reference event, holdout event, holdout block, per-block and geometry/score
 coverage quotas are met. The current empty human review means the honest status
 is `pending_label_review`, with deficits reported and no capture metrics.
 
+## Track B presence–background experiment
+
+Track B fits a sampled presence–background Logistic Regression on the same
+old-HCMC road population and frozen partitions. Its fixed feature order is
+`elevation_median_m`, `relative_elevation_m`, `slope_mean_deg`, `dist_water_m`,
+and `builtup_ratio_250m`. Only individually reviewed positive roads in the
+reference partition enter the presence set. Background candidates are complete,
+structurally eligible reference roads whose label remains `unknown`. Sampled
+background can include unreported affected roads; it supplies a fitting
+comparison, not verified negative evidence. The temporary 0/1 fit target stays
+in memory and never changes the source labels or appears in score files.
+
+Each draw samples background without replacement, with deterministic block
+quotas proportional to the eligible reference pool. The primary ratio is one
+presence to ten background roads; sensitivity ratios are 1:5 and 1:20. Each
+ratio uses seeds 42–61, giving up to 60 fitted models. A draw reports
+`background_pool_insufficient` when there are not enough unique candidates;
+failure of any primary-ratio draw withholds all fitted model and score outputs.
+Each model is a `StandardScaler` followed by `LogisticRegression(C=1.0,
+solver="lbfgs", max_iter=1000)`. Scaling and fitting use only that draw's
+reference presence/background rows. Holdout roads do not set preprocessing,
+features, hyperparameters or the choice of ratio/model.
+
+The fit gate requires at least 20 independent reviewed reference event groups,
+each with at least one feature-eligible reviewed positive road after the
+existing partition audit. It is separate from capture evaluation: capture
+requires at least 20 reference and 20 holdout events, at least three holdout
+blocks with at least five events each, complete reviewed affected geometry,
+and full score coverage. Until the fit gate passes, `scripts/train.py` writes
+`pending_positive_review` and the deficits without a model or score artifact.
+The current real-data review is empty, so its Track B status is
+`pending_positive_review`; the ready path has been verified with offline
+synthetic fixtures only.
+
+The exported `relative_score` is the Pipeline's `decision_function`, a relative
+ranking for comparison with reviewed presences. It is not a calibrated flood
+probability or a flood/non-flood classification. The training CLI publishes
+long-form scores for eligible holdout roads, model Pipelines and per-draw
+provenance including input/config/partition hashes, seed, ratio, counts,
+exclusions and block quotas. Full-network inference is a separate future step.
+`scripts/evaluate.py --track-b-scores ...` compares every available draw with
+MCDA, elevation-only and random rankings on one eligible holdout road-length
+denominator. Geometry or score-coverage deficits withhold metrics. Complete
+reports retain the existing top-k capture rules and event/block bootstrap, and
+summarize capture/lift median and IQR by ratio plus mean pairwise top-k Jaccard
+overlap across seeds.
+
+All capture results remain exploratory. Review and reporting selection may
+make the model rank where floods are observed or reported, alongside physical
+susceptibility. Background sampling does not remove that bias or identify a
+population flood rate. Unknown roads provide no basis for accuracy, precision,
+recall, F1, ROC-AUC or calibration claims as flood/non-flood classification.
+
 ## Offline report
 
 `pipeline_report.html` and its JSON companion summarize source audit, AOI and

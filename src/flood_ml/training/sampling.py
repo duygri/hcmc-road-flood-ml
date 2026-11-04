@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from flood_ml.baseline.mcda import _values_and_reasons
 from flood_ml.config import PipelineError
 from flood_ml.evaluation.capture import evaluation_gate
 from flood_ml.labeling.matching import require_ids
@@ -167,16 +168,13 @@ def build_background_draws(
     gate = evaluation_gate(confirmed_event_segments, partitions)
     label_map = labels.set_index(KEY).label_status
     part_map = partitions.set_index(KEY)
-    numeric = features.set_index(KEY)[FEATURE_COLUMNS].apply(
-        pd.to_numeric, errors="coerce"
-    )
-    complete_ids = set(numeric.index[np.isfinite(numeric.to_numpy()).all(axis=1)])
-    structurally_eligible = (
-        set(features.loc[features.score_eligible, KEY])
-        if "score_eligible" in features
-        else set(features[KEY])
-    )
-    complete_ids &= structurally_eligible
+    values, exclusion_reasons = _values_and_reasons(features)
+    numeric = values.loc[:, FEATURE_COLUMNS].copy()
+    numeric.index = pd.Index(features[KEY], name=KEY)
+    structural_mask = exclusion_reasons.eq("")
+    structurally_eligible = set(features.loc[structural_mask, KEY])
+    feature_complete_mask = values.notna().all(axis=1)
+    complete_ids = set(features.loc[structural_mask & feature_complete_mask, KEY])
 
     # Event and road review are independent conditions for fit membership.
     reviewed_road_ids = {

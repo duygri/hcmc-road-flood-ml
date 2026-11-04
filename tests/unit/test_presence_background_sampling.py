@@ -91,6 +91,33 @@ def test_structurally_ineligible_rows_are_excluded():
     }
 
 
+@pytest.mark.parametrize(
+    ("flag", "reason"),
+    [
+        ("bridge", "structurally_ineligible"),
+        ("tunnel", "structurally_ineligible"),
+        ("water_distance_incomplete", "incomplete_or_nonfinite_features"),
+    ],
+)
+def test_sampler_applies_canonical_eligibility_without_precomputed_flag(flag, reason):
+    args = case()
+    args[0][flag] = False
+    args[0].loc[args[0].road_segment_id.eq("p0"), flag] = True
+
+    result = build_background_draws(*args)
+
+    assert "score_eligible" not in args[0]
+    assert result.status == "pending_positive_review"
+    assert result.gate["feature_eligible_reference_events"] == 19
+    assert result.draws == ()
+    exclusion = next(
+        item
+        for item in result.gate["positive_exclusions"]
+        if item["road_segment_id"] == "p0"
+    )
+    assert exclusion["reason"] == reason
+
+
 def test_incomplete_or_nonfinite_training_features_are_excluded():
     args = case()
     args[0].loc[args[0].road_segment_id.eq("p0"), FEATURE_COLUMNS[0]] = np.nan

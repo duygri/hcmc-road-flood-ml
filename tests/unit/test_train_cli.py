@@ -256,6 +256,38 @@ def test_train_cli_ready_writes_scores_models_and_provenance(tmp_path):
     assert (tmp_path / "labels.parquet").read_bytes() == labels_before
 
 
+@pytest.mark.parametrize("change", ["contents", "path"])
+def test_train_cli_rejects_changed_derived_inputs_without_overwriting_run(
+    tmp_path, change
+):
+    fixture_repo(tmp_path)
+    result = cli(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    published = {
+        path: path.read_bytes()
+        for directory in (
+            "reports/runs/train_fixture",
+            "artifacts/train_fixture",
+            "data/processed/train_fixture",
+        )
+        for path in (tmp_path / directory).rglob("*")
+        if path.is_file()
+    }
+    overrides = {}
+    features = tmp_path / "features.parquet"
+    if change == "contents":
+        frame = pd.read_parquet(features)
+        frame[FEATURES[0]] += 0.1
+        frame.to_parquet(features, index=False)
+    else:
+        (tmp_path / "other-features.parquet").write_bytes(features.read_bytes())
+        overrides["features"] = "other-features.parquet"
+    result = cli(tmp_path, **overrides)
+    assert result.returncode != 0
+    assert "Track B inputs changed; choose a new run_id" in result.stderr
+    assert {path: path.read_bytes() for path in published} == published
+
+
 @pytest.mark.parametrize(
     "destination,hardlink",
     [

@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -241,6 +243,110 @@ def test_manifest_metadata_and_config_changes_reject_run_reuse(synthetic_pipelin
     manifest.write_text(manifest.read_text() + "\n# metadata-only update\n")
     with pytest.raises(PipelineError, match="fingerprint"):
         start_run(settings, context.run_id)
+
+
+def test_colab_pipeline_train_evaluate_publish_share_one_run_id(
+    synthetic_pipeline, tmp_path
+):
+    from test_track_b import run_cli
+
+    settings, _ = synthetic_pipeline
+    root = settings.repo_root
+    # The publisher requires a source commit even for this offline synthetic repo.
+    subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Synthetic Test",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "synthetic fixture",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    run_id = "colab_sequence"
+    run_cli(root, "run_pipeline", run_id)
+    reports = root / "reports/runs" / run_id
+    original_record = (reports / "run.json").read_bytes()
+    original = json.loads(original_record)
+    processed = f"data/processed/{run_id}"
+    inputs = {
+        "features": f"{processed}/road_features.parquet",
+        "labels": f"{processed}/road_labels.parquet",
+        "confirmed_event_segments": f"{processed}/confirmed_event_segments.parquet",
+        "partitions": f"{processed}/road_partitions.parquet",
+    }
+    hashes = {
+        name: hashlib.sha256((root / path).read_bytes()).hexdigest()
+        for name, path in inputs.items()
+    }
+    run_cli(root, "train", run_id, **inputs)
+    training = json.loads((reports / "track_b.json").read_text())
+    assert training["status"] == "pending_positive_review"
+    assert training["input_paths"] == inputs
+    assert training["input_hashes"] == hashes
+    assert training["run_fingerprint"] == original["fingerprint"]
+    assert training["config_hash"] == original["config_hash"]
+    run_cli(
+        root,
+        "evaluate",
+        run_id,
+        scores=f"{processed}/road_susceptibility.parquet",
+        roads=f"data/interim/{run_id}/road_segments.gpkg",
+        confirmed_event_segments=inputs["confirmed_event_segments"],
+        partitions=inputs["partitions"],
+    )
+    (reports / "runtime.json").write_text(
+        json.dumps(
+            {
+                "python_version": "3.12",
+                "uv_version": "uv 0.13.6",
+                "platform": "synthetic",
+            }
+        )
+    )
+    drive = tmp_path / "drive"
+    run_cli(root, "publish_run", run_id, drive_root=str(drive))
+    manifest = json.loads(
+        (drive / "runs" / run_id / "completion_manifest.json").read_text()
+    )
+    assert manifest["status"] == "published"
+    assert manifest["gate_statuses"]["track_b"] == "pending_positive_review"
+    assert (reports / "run.json").read_bytes() == original_record
+    assert {
+        name: hashlib.sha256((root / path).read_bytes()).hexdigest()
+        for name, path in inputs.items()
+    } == hashes
+    # The same initialization still rejects source changes before training.
+    source = settings.sources["raw_root"] / "evidence.gpkg"
+    source.write_bytes(source.read_bytes() + b"changed source snapshot")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[2] / "scripts/train.py"),
+            "--repo-root",
+            str(root),
+            "--run-id",
+            run_id,
+            *[
+                argument
+                for name, path in inputs.items()
+                for argument in (f"--{name.replace('_', '-')}", path)
+            ],
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "Run fingerprint changed" in result.stderr
+    assert (reports / "run.json").read_bytes() == original_record
 
 
 def test_reviewed_pipeline_passes_geometry_and_event_quotas(synthetic_pipeline):

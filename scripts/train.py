@@ -163,18 +163,34 @@ def main(argv: list[str] | None = None) -> int:
         run_id = args.run_id or settings.experiments["run_id"]
         publications = _preflight_publications(settings, run_id, paths, rules)
         hashes = {name: _hash_file(path) for name, path in paths.items()}
+        # Stage provenance protects derived-input identity without changing the
+        # pipeline's base fingerprint. Reject before initializing or writing.
+        if publications["report"].exists():
+            previous = json.loads(publications["report"].read_text(encoding="utf-8"))
+            if (
+                not isinstance(previous, dict)
+                or previous.get("input_paths") != inputs
+                or previous.get("input_hashes") != hashes
+            ):
+                raise PipelineError("Track B inputs changed; choose a new run_id")
         settings = replace(
             settings,
             experiments={
                 **settings.experiments,
                 "run_id": run_id,
-                "track_b_inputs": inputs,
-                "track_b_input_hashes": hashes,
             },
         )
+        # Reuse the pipeline's immutable source/config fingerprint. Derived
+        # Track B paths and hashes belong to track_b.json, not effective config.
         run = start_run(settings, run_id)
         write_json_atomic(
-            publications["report"], {"status": "started", "run_id": run_id}
+            publications["report"],
+            {
+                "status": "started",
+                "run_id": run_id,
+                "input_paths": inputs,
+                "input_hashes": hashes,
+            },
         )
         features, labels, events, partitions = (
             pd.read_parquet(paths[name])
@@ -281,7 +297,13 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 write_json_atomic(
                     publications["report"],
-                    {"status": "failed", "run_id": run.run_id, "error": str(exc)},
+                    {
+                        "status": "failed",
+                        "run_id": run.run_id,
+                        "error": str(exc),
+                        "input_paths": inputs,
+                        "input_hashes": hashes,
+                    },
                 )
             except (OSError, ValueError, TypeError):
                 pass

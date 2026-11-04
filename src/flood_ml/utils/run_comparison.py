@@ -161,6 +161,12 @@ def _geopackage_schema(path: Path, layer: str) -> list[dict]:
 
 
 def _keys(frame, name):
+    if (
+        name == "reviewed_group_partition_audit.parquet"
+        and frame.empty
+        and not len(frame.columns)
+    ):
+        return []
     if "track_b_scores" in name:
         return ["road_segment_id", "model_id"]
     if name in {
@@ -538,6 +544,16 @@ def compare_runs(
                             )
                         if "partition_sha256" in report:
                             report["partition_sha256"] = None
+                    elif path.name == "normalizer.json":
+                        # Quantile thresholds are compared under atol; the source
+                        # table digest remains visible for provenance but cannot
+                        # stand in for numerical equivalence across platforms.
+                        derived_artifact_hashes.setdefault(relative, {})[side] = {
+                            "reference_input_sha256": report.get(
+                                "reference_input_sha256"
+                            )
+                        }
+                        report.pop("reference_input_sha256", None)
                     reports.append(
                         _canonical(
                             _semantic_report(report),

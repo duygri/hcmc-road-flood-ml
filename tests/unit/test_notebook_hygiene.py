@@ -85,7 +85,7 @@ def test_notebook_pins_source_and_uses_uv_project_environment():
     for required in (
         "https://github.com/duygri/hcmc-road-flood-ml.git",
         "https://astral.sh/uv/0.13.6/install.sh",
-        "uv 0.13.6",
+        'expected="0.13.6"',
         "UV_PROJECT_ENVIRONMENT",
         "/content/.venv",
         '"--locked"',
@@ -99,6 +99,49 @@ def test_notebook_pins_source_and_uses_uv_project_environment():
     assert 'subprocess.run(["sh"], input=' in source
     assert "[0-9a-fA-F]{40}" in source
     assert "pip install" not in source
+
+
+def test_notebook_bootstrap_and_windows_replay_parse_real_uv_release_output():
+    document = notebook()
+    bootstrap = next(
+        "".join(cell["source"])
+        for cell in document["cells"]
+        if cell["cell_type"] == "code"
+        and '"https://astral.sh/uv/0.13.6/install.sh"' in "".join(cell["source"])
+    )
+    markdown = "\n".join(
+        "".join(cell["source"])
+        for cell in document["cells"]
+        if cell["cell_type"] == "markdown"
+    )
+    replay = markdown.split("```python\n")[-1].split("```")[0]
+    assert "import re" in replay
+    actual = "uv 0.13.6 (329bf9448 2026-10-26 x86_64-pc-windows-msvc)"
+    for source in (bootstrap, replay):
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "require_uv_version"
+        )
+        parser_module = ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if isinstance(node, ast.Import)
+                and any(alias.name == "re" for alias in node.names)
+            ]
+            + [function],
+            type_ignores=[],
+        )
+        namespace = {"RuntimeError": RuntimeError, "re": re}
+        exec(  # noqa: S102 - execute only the notebook's isolated version parser
+            compile(parser_module, "<uv-parser>", "exec"),
+            namespace,
+        )
+        assert namespace["require_uv_version"](actual) == actual
+        with pytest.raises(RuntimeError):
+            namespace["require_uv_version"]("uv 0.13.5 (build metadata)")
 
 
 @pytest.mark.parametrize(

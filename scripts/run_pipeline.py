@@ -40,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             if value:
                 resolved = resolve_output(settings.repo_root, value)
-                labeling[key] = str(resolved.relative_to(settings.repo_root))
+                labeling[key] = resolved.relative_to(settings.repo_root).as_posix()
         settings = replace(
             settings,
             labeling=labeling,

@@ -43,8 +43,33 @@ def runs(tmp_path):
         }
     )
     frame.to_parquet(local / f"data/processed/{RUN_ID}/road_features.parquet")
-    # Publisher fixture contains an opaque normalizer placeholder; use a real report.
+    processed = local / f"data/processed/{RUN_ID}"
+    pd.DataFrame(
+        {"road_segment_id": ["r1"], "label_status": ["unknown"], "label_binary": [None]}
+    ).to_parquet(processed / "road_labels.parquet")
+    pd.DataFrame(columns=["observation_id", "road_segment_id"]).to_parquet(
+        processed / "confirmed_event_segments.parquet"
+    )
+    pd.DataFrame(
+        {"road_segment_id": ["r1"], "block_id": ["b1"], "partition": ["reference"]}
+    ).to_parquet(processed / "road_partitions.parquet")
+    pd.DataFrame(columns=["observation_id", "road_segment_id", "partition"]).to_parquet(
+        processed / "reviewed_group_partition_audit.parquet"
+    )
+    pd.DataFrame({"road_segment_id": ["r1"]}).to_parquet(
+        processed / "analysis_dataset.parquet"
+    )
+    pd.DataFrame({"road_segment_id": ["r1"], "score": [0.5]}).to_parquet(
+        processed / "road_susceptibility.parquet"
+    )
+    pd.DataFrame(
+        {"road_segment_id": ["r1"], "weight_set": ["equal"], "score": [0.5]}
+    ).to_parquet(processed / "sensitivity_scores.parquet")
     (local / f"artifacts/{RUN_ID}/normalizer.json").write_text('{"q05": 1.0}')
+    (local / f"artifacts/{RUN_ID}/mcda_rules.json").write_text("{}")
+    (local / f"reports/runs/{RUN_ID}/weight_sensitivity.json").write_text("{}")
+    refresh_evaluation_inputs(local)
+    refresh_stages(local)
     published = publish_run(local, tmp_path / "drive", RUN_ID)
     update(
         published,
@@ -58,6 +83,37 @@ def runs(tmp_path):
     # Refresh manifest after adapting published runtime provenance to a Colab root.
     refresh(published)
     return published, local
+
+
+def refresh_stages(root):
+    import hashlib
+
+    completion_path = root / f"reports/runs/{RUN_ID}/pipeline_complete.json"
+    completion = json.loads(completion_path.read_text())
+    markers = {}
+    for stage in completion["stage_markers"]:
+        marker_path = root / f"reports/runs/{RUN_ID}/stages/{stage}.json"
+        marker = json.loads(marker_path.read_text())
+        marker["outputs"] = {
+            output: hashlib.sha256(Path(output).read_bytes()).hexdigest()
+            for output in marker["outputs"]
+        }
+        marker_path.write_text(json.dumps(marker))
+        markers[stage] = hashlib.sha256(marker_path.read_bytes()).hexdigest()
+    completion["stage_markers"] = markers
+    completion_path.write_text(json.dumps(completion))
+
+
+def refresh_evaluation_inputs(root):
+    import hashlib
+
+    path = root / f"reports/runs/{RUN_ID}/evaluation.json"
+    report = json.loads(path.read_text())
+    report["input_hashes"] = {
+        name: hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        for name, relative in report["input_paths"].items()
+    }
+    path.write_text(json.dumps(report))
 
 
 def refresh(root):
@@ -178,7 +234,7 @@ def test_compare_runs_rejects_source_lock_or_input_hash_mismatch(runs, field, va
 def test_compare_runs_accepts_matching_pending_track_b_without_scores(runs):
     published, local = runs
     report = compare_runs(published, local, RUN_ID)
-    assert report["equivalent"]
+    assert report["equivalent"], report["differences"]
     assert report["gate_statuses"]["local"]["track_b"] == "pending_positive_review"
     update(local, "track_b", status="ready")
     assert not compare_runs(published, local, RUN_ID)["equivalent"]
@@ -374,6 +430,55 @@ def test_compare_runs_uses_reviewed_link_key_for_partition_audit(runs):
     assert compare_runs(published, local, RUN_ID)["equivalent"]
 
 
+def test_compare_runs_accepts_legacy_empty_no_review_partition_audit(runs):
+    published, local = runs
+    add_table(
+        published, local, "reviewed_group_partition_audit.parquet", pd.DataFrame()
+    )
+    report = compare_runs(published, local, RUN_ID)
+    assert report["equivalent"], report["differences"]
+
+
+def test_compare_runs_uses_normalizer_threshold_tolerance_and_retains_hashes(runs):
+    from flood_ml.baseline.mcda import FEATURE_SPEC, fit_normalizer
+
+    published, local = runs
+    base = pd.DataFrame(
+        {
+            "road_segment_id": [f"r{i:02d}" for i in range(30)],
+            "elevation_median_m": [float(i) for i in range(30)],
+            "relative_elevation_m": [float(i + 1) for i in range(30)],
+            "slope_mean_deg": [float(i + 2) for i in range(30)],
+            "dist_water_m": [float(i + 3) for i in range(30)],
+            "builtup_ratio_250m": [i / 30 for i in range(30)],
+        }
+    )
+    jittered = base.copy()
+    jittered["elevation_median_m"] += 1e-6
+    normalizers = [
+        fit_normalizer(frame, dict(FEATURE_SPEC)) for frame in (base, jittered)
+    ]
+    assert (
+        normalizers[0]["reference_input_sha256"]
+        != normalizers[1]["reference_input_sha256"]
+    )
+    for root, value in zip((published, local), normalizers, strict=True):
+        path = root / f"artifacts/{RUN_ID}/normalizer.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+    refresh(published)
+    report = compare_runs(published, local, RUN_ID)
+    assert report["equivalent"], report["differences"]
+    trace = report["derived_artifact_hashes"][f"artifacts/{RUN_ID}/normalizer.json"]
+    assert (
+        trace["published"]["reference_input_sha256"]
+        == normalizers[0]["reference_input_sha256"]
+    )
+    assert (
+        trace["local"]["reference_input_sha256"]
+        == normalizers[1]["reference_input_sha256"]
+    )
+
+
 def test_compare_runs_requires_required_reports_in_manifest(runs):
     published, local = runs
     path = published / "completion_manifest.json"
@@ -475,7 +580,21 @@ def test_compare_runs_normalizes_real_evaluation_cli_paths_without_hiding_settin
     pd.DataFrame(columns=LINK_COLUMNS).to_parquet(
         processed / "confirmed_event_segments.parquet"
     )
+    pd.DataFrame(
+        {"road_segment_id": ["r1"], "label_status": ["unknown"], "label_binary": [None]}
+    ).to_parquet(processed / "road_labels.parquet")
+    pd.DataFrame(columns=["observation_id", "road_segment_id", "partition"]).to_parquet(
+        processed / "reviewed_group_partition_audit.parquet"
+    )
+    pd.DataFrame({"road_segment_id": ["r1"]}).to_parquet(
+        processed / "analysis_dataset.parquet"
+    )
+    pd.DataFrame(
+        {"road_segment_id": ["r1"], "weight_set": ["equal"], "score": [0.5]}
+    ).to_parquet(processed / "sensitivity_scores.parquet")
     (colab / f"artifacts/{RUN_ID}/normalizer.json").write_text('{"q05": 1.0}')
+    (colab / f"artifacts/{RUN_ID}/mcda_rules.json").write_text("{}")
+    (colab / f"reports/runs/{RUN_ID}/weight_sensitivity.json").write_text("{}")
     (colab / "uv.lock").write_text("same lock")
     local_configs = colab / "configs/local"
     local_configs.mkdir()
@@ -527,6 +646,8 @@ def test_compare_runs_normalizes_real_evaluation_cli_paths_without_hiding_settin
     assert snapshots[0]["repo_root"] != snapshots[1]["repo_root"]
     assert snapshots[0]["sources"]["raw_root"] != snapshots[1]["sources"]["raw_root"]
     assert snapshots[0]["configuration_paths"] != snapshots[1]["configuration_paths"]
+    refresh_evaluation_inputs(colab)
+    refresh_stages(colab)
     published = publish_run(colab, tmp_path / "drive", RUN_ID)
     report = compare_runs(published, local, RUN_ID)
     assert report["equivalent"], report["differences"]

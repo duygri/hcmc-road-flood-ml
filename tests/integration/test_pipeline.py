@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -323,6 +324,57 @@ def test_colab_pipeline_train_evaluate_publish_share_one_run_id(
         name: hashlib.sha256((root / path).read_bytes()).hexdigest()
         for name, path in inputs.items()
     } == hashes
+
+    # Replay in an independent checkout with the same commit and raw snapshot.
+    # Runtime-sidecar files are part of the published bundle and are recreated
+    # locally so the verifier compares equivalent run-scoped file inventories.
+    (reports / "colab_summary.md").write_text("synthetic pending run\n")
+    (reports / "stdout.log").write_text("synthetic stdout\n")
+    (reports / "stderr.log").write_text("synthetic stderr\n")
+    # The first publication predates these synthetic sidecars, so publish a
+    # fresh bundle after the complete expected inventory exists.
+    drive = tmp_path / "drive-replay"
+    run_cli(root, "publish_run", run_id, drive_root=str(drive))
+    replay = tmp_path / "replay"
+    shutil.copytree(
+        root,
+        replay,
+        ignore=shutil.ignore_patterns("reports", "artifacts", "interim", "processed"),
+    )
+    replay_inputs = {name: path for name, path in inputs.items()}
+    run_cli(replay, "run_pipeline", run_id)
+    run_cli(replay, "train", run_id, **replay_inputs)
+    run_cli(
+        replay,
+        "evaluate",
+        run_id,
+        scores=f"{processed}/road_susceptibility.parquet",
+        roads=f"data/interim/{run_id}/road_segments.gpkg",
+        confirmed_event_segments=inputs["confirmed_event_segments"],
+        partitions=inputs["partitions"],
+    )
+    replay_reports = replay / "reports/runs" / run_id
+    for name in ("runtime.json", "colab_summary.md", "stdout.log", "stderr.log"):
+        shutil.copyfile(reports / name, replay_reports / name)
+    verify = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[2] / "scripts/verify_colab_run.py"),
+            "--published-run",
+            str(drive / "runs" / run_id),
+            "--repo-root",
+            str(replay),
+            "--run-id",
+            run_id,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    verification = json.loads((replay_reports / "local_verification.json").read_text())
+    assert verify.returncode == 0, (verify.stderr, verification["differences"])
+    assert verification["equivalent"], verification["differences"]
+
     # The same initialization still rejects source changes before training.
     source = settings.sources["raw_root"] / "evidence.gpkg"
     source.write_bytes(source.read_bytes() + b"changed source snapshot")
@@ -347,6 +399,40 @@ def test_colab_pipeline_train_evaluate_publish_share_one_run_id(
     assert result.returncode != 0
     assert "Run fingerprint changed" in result.stderr
     assert (reports / "run.json").read_bytes() == original_record
+
+
+def test_present_match_review_path_keeps_pipeline_and_train_on_same_run_id(
+    synthetic_pipeline,
+):
+    from test_track_b import run_cli
+
+    from flood_ml.labeling.reviews import MATCH_COLUMNS
+
+    settings, _ = synthetic_pipeline
+    root = settings.repo_root
+    run_id = "review_path_sequence"
+    review_dir = root / "configs/local"
+    review_dir.mkdir(parents=True)
+    review_path = review_dir / "review_decisions.csv"
+    pd.DataFrame(columns=MATCH_COLUMNS).to_csv(review_path, index=False)
+    relative_review = review_path.relative_to(root).as_posix()
+    run_cli(root, "run_pipeline", run_id, match_reviews=relative_review)
+    reports = root / "reports/runs" / run_id
+    original = json.loads((reports / "run.json").read_text())
+    inputs = {
+        "features": f"data/processed/{run_id}/road_features.parquet",
+        "labels": f"data/processed/{run_id}/road_labels.parquet",
+        "confirmed_event_segments": f"data/processed/{run_id}/confirmed_event_segments.parquet",
+        "partitions": f"data/processed/{run_id}/road_partitions.parquet",
+    }
+    run_cli(root, "train", run_id, **inputs)
+    training = json.loads((reports / "track_b.json").read_text())
+    assert (
+        original["review_hashes"]["match_reviews"]
+        == hashlib.sha256(review_path.read_bytes()).hexdigest()
+    )
+    assert training["run_fingerprint"] == original["fingerprint"]
+    assert training["status"] == "pending_positive_review"
 
 
 def test_reviewed_pipeline_passes_geometry_and_event_quotas(synthetic_pipeline):

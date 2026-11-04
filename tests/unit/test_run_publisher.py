@@ -34,15 +34,7 @@ def fixture_run(root: Path, *, track_b_status="pending_positive_review") -> Path
                 "review_hashes": {"review": "reviewhash"},
             },
         ),
-        (
-            "reports/runs",
-            "pipeline_complete.json",
-            {
-                "status": "complete",
-                "run_id": RUN_ID,
-                "evaluation_status": "pending_label_review",
-            },
-        ),
+        ("reports/runs", "pipeline_complete.json", {}),
         (
             "reports/runs",
             "pipeline_report.json",
@@ -51,11 +43,7 @@ def fixture_run(root: Path, *, track_b_status="pending_positive_review") -> Path
                 "evaluation_status": "pending_label_review",
             },
         ),
-        (
-            "reports/runs",
-            "evaluation.json",
-            {"status": "pending_label_review", "evaluation_performed": False},
-        ),
+        ("reports/runs", "evaluation.json", {}),
         (
             "reports/runs",
             "track_b.json",
@@ -74,14 +62,102 @@ def fixture_run(root: Path, *, track_b_status="pending_positive_review") -> Path
         path = root / directory / RUN_ID / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(content), encoding="utf-8")
-    for relative, content in [
-        (f"data/processed/{RUN_ID}/road_features.parquet", b"processed"),
-        (f"data/interim/{RUN_ID}/roads.gpkg", b"interim"),
-        (f"artifacts/{RUN_ID}/normalizer.json", b"artifact"),
-    ]:
+    output_bytes = {
+        f"data/processed/{RUN_ID}/road_features.parquet": b"processed",
+        f"data/processed/{RUN_ID}/road_labels.parquet": b"labels",
+        f"data/processed/{RUN_ID}/confirmed_event_segments.parquet": b"events",
+        f"data/processed/{RUN_ID}/road_partitions.parquet": b"partitions",
+        f"data/processed/{RUN_ID}/reviewed_group_partition_audit.parquet": b"audit",
+        f"data/processed/{RUN_ID}/analysis_dataset.parquet": b"analysis",
+        f"data/processed/{RUN_ID}/road_susceptibility.parquet": b"scores",
+        f"data/processed/{RUN_ID}/sensitivity_scores.parquet": b"sensitivity-scores",
+        f"data/interim/{RUN_ID}/roads.gpkg": b"interim",
+        f"artifacts/{RUN_ID}/normalizer.json": b"artifact",
+        f"artifacts/{RUN_ID}/mcda_rules.json": b"rules",
+        f"reports/runs/{RUN_ID}/weight_sensitivity.json": b"sensitivity",
+        f"reports/runs/{RUN_ID}/pipeline_report.html": b"report-html",
+    }
+    for relative, content in output_bytes.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
+
+    processed = f"data/processed/{RUN_ID}"
+    evaluation_inputs = {
+        "scores": f"{processed}/road_susceptibility.parquet",
+        "roads": f"data/interim/{RUN_ID}/roads.gpkg",
+        "confirmed_event_segments": f"{processed}/confirmed_event_segments.parquet",
+        "partitions": f"{processed}/road_partitions.parquet",
+    }
+    (root / f"reports/runs/{RUN_ID}/evaluation.json").write_text(
+        json.dumps(
+            {
+                "run_id": RUN_ID,
+                "status": "pending_label_review",
+                "evaluation_performed": False,
+                "input_paths": evaluation_inputs,
+                "input_hashes": {
+                    name: hashlib.sha256((root / path).read_bytes()).hexdigest()
+                    for name, path in evaluation_inputs.items()
+                },
+                "source_inputs_unchanged": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_outputs = {
+        "features": [f"data/processed/{RUN_ID}/road_features.parquet"],
+        "labels": [f"data/processed/{RUN_ID}/road_labels.parquet"],
+        "split": [
+            f"data/processed/{RUN_ID}/confirmed_event_segments.parquet",
+            f"data/processed/{RUN_ID}/road_partitions.parquet",
+            f"data/processed/{RUN_ID}/reviewed_group_partition_audit.parquet",
+        ],
+        "mcda": [
+            f"data/processed/{RUN_ID}/analysis_dataset.parquet",
+            f"data/processed/{RUN_ID}/road_susceptibility.parquet",
+            f"data/processed/{RUN_ID}/sensitivity_scores.parquet",
+            f"artifacts/{RUN_ID}/normalizer.json",
+            f"artifacts/{RUN_ID}/mcda_rules.json",
+            f"reports/runs/{RUN_ID}/weight_sensitivity.json",
+        ],
+        "evaluation": [f"reports/runs/{RUN_ID}/evaluation.json"],
+        "report": [
+            f"reports/runs/{RUN_ID}/pipeline_report.json",
+            f"reports/runs/{RUN_ID}/pipeline_report.html",
+        ],
+    }
+    stage_markers = {}
+    for stage in ("validate", "aoi", "roads", "observations", "raster", *stage_outputs):
+        outputs = {
+            str((root / relative).resolve()): hashlib.sha256(
+                (root / relative).read_bytes()
+            ).hexdigest()
+            for relative in stage_outputs.get(stage, [])
+        }
+        marker = root / f"reports/runs/{RUN_ID}/stages/{stage}.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "stage": stage,
+                    "status": "complete",
+                    "run_id": RUN_ID,
+                    "outputs": outputs,
+                }
+            ),
+            encoding="utf-8",
+        )
+        stage_markers[stage] = hashlib.sha256(marker.read_bytes()).hexdigest()
+    completion = {
+        "status": "complete",
+        "run_id": RUN_ID,
+        "evaluation_status": "pending_label_review",
+        "stage_markers": stage_markers,
+    }
+    (root / f"reports/runs/{RUN_ID}/pipeline_complete.json").write_text(
+        json.dumps(completion), encoding="utf-8"
+    )
     return root
 
 
@@ -95,15 +171,24 @@ def ready_track_b(repo: Path, *, extra_output: str | None = None) -> None:
     report.update(
         status="ready",
         output_hashes={
-            f"data/processed/{RUN_ID}/track_b_scores.parquet": "scorehash",
-            f"artifacts/{RUN_ID}/model.joblib": "modelhash",
+            f"data/processed/{RUN_ID}/track_b_scores.parquet": hashlib.sha256(
+                score.read_bytes()
+            ).hexdigest(),
+            f"artifacts/{RUN_ID}/model.joblib": hashlib.sha256(
+                model.read_bytes()
+            ).hexdigest(),
         },
         draws=[
             {"status": "fitted", "model_artifact": f"artifacts/{RUN_ID}/model.joblib"}
         ],
     )
     if extra_output:
-        report["output_hashes"][extra_output] = "extrahash"
+        extra_path = repo / extra_output
+        report["output_hashes"][extra_output] = (
+            hashlib.sha256(extra_path.read_bytes()).hexdigest()
+            if extra_path.is_file()
+            else "0" * 64
+        )
     report_path.write_text(json.dumps(report), encoding="utf-8")
 
 
@@ -156,6 +241,57 @@ def test_publisher_accepts_pending_track_b_without_model_or_track_b_scores(tmp_p
     assert (published / "completion_manifest.json").is_file()
 
 
+@pytest.mark.parametrize(
+    "relative",
+    [
+        f"data/processed/{RUN_ID}/analysis_dataset.parquet",
+        f"data/processed/{RUN_ID}/road_susceptibility.parquet",
+    ],
+)
+def test_publisher_rejects_missing_required_pending_stage_output(tmp_path, relative):
+    repo = fixture_run(tmp_path / "repo")
+    (repo / relative).unlink()
+    with pytest.raises(PipelineError, match="missing|stage output"):
+        publish_run(repo, tmp_path / "drive", RUN_ID)
+    assert not (tmp_path / "drive/runs" / RUN_ID).exists()
+
+
+def test_publisher_rejects_missing_declared_stage_artifact(tmp_path):
+    repo = fixture_run(tmp_path / "repo")
+    (repo / f"data/processed/{RUN_ID}/sensitivity_scores.parquet").unlink()
+    with pytest.raises(PipelineError, match="missing|stage output"):
+        publish_run(repo, tmp_path / "drive", RUN_ID)
+    assert not (tmp_path / "drive/runs" / RUN_ID).exists()
+
+
+def test_publisher_rejects_present_ready_model_with_wrong_recorded_digest(tmp_path):
+    repo = fixture_run(tmp_path / "repo")
+    ready_track_b(repo)
+    report_path = repo / f"reports/runs/{RUN_ID}/track_b.json"
+    report = json.loads(report_path.read_text())
+    report["output_hashes"][f"artifacts/{RUN_ID}/model.joblib"] = "0" * 64
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(PipelineError, match="Track B.*hash|digest"):
+        publish_run(repo, tmp_path / "drive", RUN_ID)
+    assert not (tmp_path / "drive/runs" / RUN_ID).exists()
+
+
+def test_publisher_publishes_ready_track_b_with_real_hashes(tmp_path):
+    repo = fixture_run(tmp_path / "repo")
+    ready_track_b(repo)
+    published = publish_run(repo, tmp_path / "drive", RUN_ID)
+    manifest = json.loads((published / "completion_manifest.json").read_text())
+    for relative in (
+        f"data/processed/{RUN_ID}/track_b_scores.parquet",
+        f"artifacts/{RUN_ID}/model.joblib",
+    ):
+        record = manifest["files"][relative]
+        assert (
+            record["sha256"]
+            == hashlib.sha256((published / relative).read_bytes()).hexdigest()
+        )
+
+
 def test_publisher_requires_ready_track_b_artifacts(tmp_path):
     repo = fixture_run(tmp_path / "repo", track_b_status="ready")
     with pytest.raises(PipelineError, match="Track B.*artifact|track_b.*artifact"):
@@ -174,11 +310,11 @@ def test_publisher_rejects_ready_track_b_artifacts_outside_selected_run_roots(
     tmp_path, extra_output
 ):
     repo = fixture_run(tmp_path / "repo")
-    ready_track_b(repo, extra_output=extra_output)
     if "another_run" in extra_output:
         other_run_artifact = repo / extra_output
         other_run_artifact.parent.mkdir(parents=True)
         other_run_artifact.write_bytes(b"other run")
+    ready_track_b(repo, extra_output=extra_output)
     with pytest.raises(PipelineError, match="outside selected run outputs"):
         publish_run(repo, tmp_path / "drive", RUN_ID)
     assert not (tmp_path / "drive/runs" / RUN_ID).exists()

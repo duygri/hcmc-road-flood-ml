@@ -11,6 +11,24 @@ from flood_ml.config import (
     load_settings,
     resolve_output,
 )
+from flood_ml.pipeline import STAGE_ORDER
+
+_REQUIRED_STAGE_OUTPUTS = (
+    ("processed", "road_features.parquet"),
+    ("processed", "road_labels.parquet"),
+    ("processed", "confirmed_event_segments.parquet"),
+    ("processed", "road_partitions.parquet"),
+    ("processed", "reviewed_group_partition_audit.parquet"),
+    ("processed", "analysis_dataset.parquet"),
+    ("processed", "road_susceptibility.parquet"),
+    ("processed", "sensitivity_scores.parquet"),
+    ("artifacts", "normalizer.json"),
+    ("artifacts", "mcda_rules.json"),
+    ("reports", "weight_sensitivity.json"),
+    ("reports", "pipeline_report.json"),
+    ("reports", "pipeline_report.html"),
+)
+_EVALUATION_INPUTS = {"scores", "roads", "confirmed_event_segments", "partitions"}
 
 
 def _read_json(path: Path) -> dict:
@@ -43,6 +61,16 @@ def _manifest_required_files(
         output_hashes = track_b.get("output_hashes") or {}
         if not isinstance(output_hashes, dict):
             raise PipelineError("Ready Track B output hashes must be a mapping")
+        if any(
+            not isinstance(path, str)
+            or not path
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            for path, digest in output_hashes.items()
+        ):
+            raise PipelineError(
+                "Ready Track B output hashes must contain SHA-256 values"
+            )
         paths = set(output_hashes)
         for draw in track_b.get("draws", []):
             if draw.get("status") == "fitted" and draw.get("model_artifact"):
@@ -69,6 +97,11 @@ def _manifest_required_files(
                 raise PipelineError(f"Track B artifact is transient or linked: {value}")
             if not path.is_file():
                 raise PipelineError(f"Required Track B artifact is missing: {value}")
+            expected = output_hashes.get(value)
+            if not expected or _hash_file(path) != expected:
+                raise PipelineError(
+                    f"Track B artifact digest does not match producer report: {value}"
+                )
             required.add(path)
     elif track_b.get("status") not in {
         "pending_positive_review",
@@ -77,6 +110,113 @@ def _manifest_required_files(
         raise PipelineError(
             f"Track B status is not publishable: {track_b.get('status')!r}"
         )
+    return required
+
+
+def _validate_completion_outputs(
+    repo_root: Path,
+    run_id: str,
+    completion: dict,
+    source_roots: dict[str, Path],
+    outputs: dict,
+    evaluation: dict,
+) -> set[Path]:
+    """Verify completed stage markers and their declared files before copying."""
+    marker_hashes = completion.get("stage_markers")
+    if not isinstance(marker_hashes, dict) or set(marker_hashes) != set(STAGE_ORDER):
+        raise PipelineError("Completion marker must declare every completed stage")
+
+    declared: set[Path] = set()
+    for stage in STAGE_ORDER:
+        marker_path = source_roots["reports"] / "stages" / f"{stage}.json"
+        expected_marker_hash = marker_hashes.get(stage)
+        if (
+            not isinstance(expected_marker_hash, str)
+            or not marker_path.is_file()
+            or marker_path.is_symlink()
+            or _hash_file(marker_path) != expected_marker_hash
+        ):
+            raise PipelineError(
+                f"Stage completion marker is missing or changed: {stage}"
+            )
+        marker = _read_json(marker_path)
+        stage_outputs = marker.get("outputs")
+        if (
+            marker.get("stage") != stage
+            or marker.get("run_id") != run_id
+            or marker.get("status") != "complete"
+            or not isinstance(stage_outputs, dict)
+        ):
+            raise PipelineError(f"Stage completion record is invalid: {stage}")
+        for raw_path, expected_hash in stage_outputs.items():
+            if not isinstance(raw_path, str) or not raw_path:
+                raise PipelineError(f"Stage {stage} declares an invalid output path")
+            path = Path(raw_path).resolve()
+            if not path.is_relative_to(repo_root):
+                raise PipelineError(
+                    f"Stage output is outside the repository: {raw_path}"
+                )
+            selected_root = next(
+                (root for root in source_roots.values() if path.is_relative_to(root)),
+                None,
+            )
+            if selected_root is None:
+                # Interim is deliberately omitted unless publish_interim is enabled.
+                interim_root = resolve_output(
+                    repo_root, f"{outputs['interim']}/{run_id}"
+                )
+                if path.is_relative_to(interim_root) and "interim" not in source_roots:
+                    continue
+                raise PipelineError(
+                    f"Stage output is outside selected run roots: {raw_path}"
+                )
+            if path.is_symlink() or not path.is_file():
+                raise PipelineError(f"Declared stage output is missing: {raw_path}")
+            declared.add(path)
+            # The evaluation CLI replaces the stage checkpoint's evaluation.json
+            # with a final report containing hashes of the actual CLI inputs.
+            if path == source_roots["reports"] / "evaluation.json":
+                continue
+            if (
+                not isinstance(expected_hash, str)
+                or len(expected_hash) != 64
+                or _hash_file(path) != expected_hash
+            ):
+                raise PipelineError(f"Declared stage output hash mismatch: {raw_path}")
+
+    required = set()
+    for category, filename in _REQUIRED_STAGE_OUTPUTS:
+        path = resolve_output(repo_root, f"{outputs[category]}/{run_id}/{filename}")
+        if not path.is_file() or path.is_symlink():
+            raise PipelineError(f"Required stage output is missing: {path}")
+        if path not in declared:
+            raise PipelineError(f"Required output is not declared by a stage: {path}")
+        required.add(path)
+
+    paths = evaluation.get("input_paths")
+    hashes = evaluation.get("input_hashes")
+    if (
+        evaluation.get("run_id") != run_id
+        or evaluation.get("source_inputs_unchanged") is not True
+        or not isinstance(paths, dict)
+        or not isinstance(hashes, dict)
+        or not _EVALUATION_INPUTS.issubset(paths)
+        or set(paths) != set(hashes)
+    ):
+        raise PipelineError("Final evaluation report has an invalid input contract")
+    for role, relative in paths.items():
+        digest = hashes.get(role)
+        if (
+            not isinstance(relative, str)
+            or not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            raise PipelineError(
+                "Final evaluation report has invalid input paths or hashes"
+            )
+        path = resolve_output(repo_root, relative)
+        if path.is_symlink() or not path.is_file() or _hash_file(path) != digest:
+            raise PipelineError(f"Final evaluation input hash does not match: {role}")
     return required
 
 
@@ -164,7 +304,11 @@ def publish_run(
         raise PipelineError("Pipeline report does not declare a complete run")
     if not evaluation.get("status") or not pipeline.get("evaluation_status"):
         raise PipelineError("Evaluation gate status is missing")
+    completion_required = _validate_completion_outputs(
+        repo_root, run_id, completion, source_roots, outputs, evaluation
+    )
     extra_required = _manifest_required_files(repo_root, track_b, source_roots)
+    extra_required.update(completion_required)
     files = []
     for source_root in source_roots.values():
         if not source_root.is_dir():

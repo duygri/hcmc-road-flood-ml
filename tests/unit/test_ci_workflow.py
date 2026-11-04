@@ -27,6 +27,7 @@ def test_ci_matrix_contains_windows_and_linux_and_uses_locked_commands():
         "uv run pytest -q",
     }
     for job in matrix_jobs:
+        assert job["runs-on"] == "${{ matrix.os }}"
         setup_uv = [
             step
             for step in job["steps"]

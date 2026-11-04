@@ -334,3 +334,40 @@ def test_train_publication_backup_failure_preserves_previous_output(
     with pytest.raises(OSError, match="synthetic backup failure"):
         module._publish([(temporary, destination)], tmp_path / "report.json", {})
     assert destination.read_bytes() == b"previous model"
+
+
+def test_train_cli_backup_cleanup_failure_keeps_ready_report_and_outputs(
+    tmp_path, monkeypatch
+):
+    fixture_repo(tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "track_b_train", ROOT / "scripts/train.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.main(arguments(tmp_path)) == 0
+    original_unlink = Path.unlink
+
+    def fail_backup_cleanup(path, *args, **kwargs):
+        if path.exists() and path.name.startswith(".track_b_r10_s42.joblib."):
+            raise OSError("synthetic backup cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", fail_backup_cleanup)
+        result = module.main(arguments(tmp_path))
+
+    assert result == 0
+    payload = report(tmp_path)
+    assert payload["status"] == "ready"
+    scores = pd.read_parquet(
+        tmp_path / "data/processed/train_fixture/track_b_scores.parquet"
+    )
+    assert len(scores) == 120
+    models = list(
+        (tmp_path / "artifacts/train_fixture/track_b_models").glob("*.joblib")
+    )
+    assert len(models) == 60
+    assert isinstance(joblib.load(models[0]), Pipeline)
+    for path, expected in payload["output_hashes"].items():
+        assert hashlib.sha256((tmp_path / path).read_bytes()).hexdigest() == expected

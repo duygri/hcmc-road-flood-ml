@@ -105,7 +105,11 @@ def _publish(staged, report_path, payload):
         raise
     else:
         for backup in backups.values():
-            backup.unlink(missing_ok=True)
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                # Publication is committed; leftover backups cannot undo it.
+                pass
 
 
 def _draw_reports(sampling, rules):

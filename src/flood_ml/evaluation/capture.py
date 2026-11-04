@@ -468,7 +468,7 @@ def _track_b_table(scores, partitions):
     ):
         raise PipelineError("Track B ratio/seed draws must have distinct model IDs")
     table["relative_score"] = pd.to_numeric(table.relative_score, errors="coerce")
-    if not np.isfinite(table.relative_score).all():
+    if table.relative_score.isna().any() or not np.isfinite(table.relative_score).all():
         raise PipelineError("Track B relative scores must be finite")
     partition_map = partitions.set_index(KEY).partition
     if (

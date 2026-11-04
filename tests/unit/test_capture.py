@@ -528,6 +528,14 @@ def test_capture_rejects_duplicate_or_nonfinite_track_b_scores(capture_case, pro
         evaluate_capture(**capture_case, track_b_scores=scores)
 
 
+def test_capture_rejects_nullable_missing_track_b_score_before_metrics(capture_case):
+    scores = track_b_frame(capture_case)
+    scores["relative_score"] = scores.relative_score.astype("Float64")
+    scores.loc[0, "relative_score"] = pd.NA
+    with pytest.raises(PipelineError, match="Track B relative scores must be finite"):
+        evaluate_capture(**capture_case, track_b_scores=scores)
+
+
 def test_capture_rejects_two_models_claiming_the_same_ratio_seed(capture_case):
     scores = track_b_frame(capture_case)
     scores.loc[scores.model_id.eq("track_b_r10_s43"), "seed"] = 42

@@ -399,6 +399,171 @@ def test_evaluation_rules_cannot_relax_the_data_gate(capture_case):
         evaluate_capture(**capture_case)
 
 
+def track_b_frame(case):
+    holdout = case["scores"].loc[
+        lambda x: x.road_segment_id.ne("r"), ["road_segment_id", "score"]
+    ]
+    frames = []
+    for ratio, seed in [(10, 42), (10, 43), (5, 42)]:
+        frame = holdout.rename(columns={"score": "relative_score"}).copy()
+        frame["model_id"] = f"track_b_r{ratio}_s{seed}"
+        frame["background_ratio"] = ratio
+        frame["seed"] = seed
+        frame["partition"] = "holdout"
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_capture_without_track_b_keeps_legacy_methods(capture_case):
+    original = evaluate_capture(**capture_case)
+    assert evaluate_capture(**capture_case, track_b_scores=None) == original
+    assert set(original["methods"]) == {"mcda", "elevation_only", "random"}
+    assert not {"track_b_stability", "track_b_coverage"}.intersection(original)
+
+
+def test_capture_reports_each_track_b_draw_on_common_population(capture_case):
+    capture_case["scores"].loc[lambda x: x.road_segment_id.eq("f"), "mcda_eligible"] = (
+        False
+    )
+    legacy = evaluate_capture(**capture_case)
+    scores = track_b_frame(capture_case)
+    result = evaluate_capture(**capture_case, track_b_scores=scores)
+    assert result["status"] == "complete"
+    assert result["exploratory"] is True
+    assert result["track_b_coverage"]["status"] == "ready"
+    assert result["eligible_road_segment_ids"] == ["a", "b", "c", "d"]
+    for name in ("mcda", "elevation_only", "random"):
+        assert result["methods"][name] == legacy["methods"][name]
+    assert set(result["methods"]["track_b"]) == set(scores.model_id)
+    for model in result["methods"]["track_b"].values():
+        assert model["eligible_road_length_m"] == result["eligible_road_length_m"]
+        for fraction, metric in model["top_k"].items():
+            baseline = legacy["methods"]["mcda"]["top_k"][fraction]
+            assert metric["capture"] == baseline["capture"]
+            assert metric["capture_any"] == baseline["capture_any"]
+            assert metric["capture_all"] == baseline["capture_all"]
+            assert metric["lift"] == baseline["lift"]
+            assert metric["capture_difference_vs_mcda"] == 0
+            assert "lift_vs_elevation_only" in metric
+            assert metric["uncertainty"] == baseline["uncertainty"]
+    stability = result["track_b_stability"]["by_background_ratio"]["10"]
+    assert stability["seeds"] == [42, 43]
+    for metric in stability["top_k"].values():
+        assert metric["capture"]["iqr"] == 0
+        assert metric["mean_pairwise_jaccard"] == 1
+    assert result == evaluate_capture(**capture_case, track_b_scores=scores.iloc[::-1])
+    json.dumps(result, allow_nan=False)
+
+
+def test_capture_missing_track_b_score_returns_pending_coverage(capture_case):
+    scores = track_b_frame(capture_case)
+    # f has no event; coverage must still require every eligible holdout road.
+    scores = scores.loc[
+        ~(scores.model_id.eq("track_b_r10_s42") & scores.road_segment_id.eq("f"))
+    ]
+    result = evaluate_capture(**capture_case, track_b_scores=scores)
+    assert result["status"] == "pending_track_b_coverage"
+    assert result["evaluation_performed"] is False
+    assert "methods" not in result
+    assert "track_b_stability" not in result
+    coverage = result["track_b_coverage"]
+    assert coverage["models"]["track_b_r10_s42"]["missing_road_segment_ids"] == ["f"]
+
+
+def test_capture_empty_track_b_population_is_pending(capture_case):
+    result = evaluate_capture(
+        **capture_case, track_b_scores=track_b_frame(capture_case).iloc[:0]
+    )
+    assert result["status"] == "pending_track_b_coverage"
+    assert result["track_b_coverage"]["model_count"] == 0
+    assert "methods" not in result
+
+
+def test_track_b_stability_compares_seed_rankings_within_ratio(capture_case):
+    scores = track_b_frame(capture_case)
+    reverse = scores.model_id.eq("track_b_r10_s43")
+    scores.loc[reverse, "relative_score"] *= -1
+    result = evaluate_capture(**capture_case, track_b_scores=scores)
+    models = result["methods"]["track_b"]
+    stability = result["track_b_stability"]["by_background_ratio"]
+    for fraction, metric in stability["10"]["top_k"].items():
+        draws = [models[f"track_b_r10_s{seed}"]["top_k"][fraction] for seed in (42, 43)]
+        captures = [draw["capture"] for draw in draws]
+        assert metric["capture"]["median"] == float(np.median(captures))
+        assert metric["capture"]["iqr"] == float(
+            np.quantile(captures, 0.75) - np.quantile(captures, 0.25)
+        )
+        first, second = [set(draw["selected_road_segment_ids"]) for draw in draws]
+        assert metric["mean_pairwise_jaccard"] == len(first & second) / len(
+            first | second
+        )
+        assert stability["5"]["top_k"][fraction]["mean_pairwise_jaccard"] is None
+
+
+def test_capture_geometry_gate_withholds_track_b_metrics(capture_case):
+    capture_case["confirmed_event_segments"]["affected_geometry_complete"] = False
+    result = evaluate_capture(
+        **capture_case, track_b_scores=track_b_frame(capture_case)
+    )
+    assert result["status"] == "pending_label_review"
+    assert result["evaluation_performed"] is False
+    assert "methods" not in result
+    assert "track_b_stability" not in result
+
+
+@pytest.mark.parametrize(
+    "problem", ["duplicate", "nan", "inf", "metadata", "partition"]
+)
+def test_capture_rejects_duplicate_or_nonfinite_track_b_scores(capture_case, problem):
+    scores = track_b_frame(capture_case)
+    if problem == "duplicate":
+        scores = pd.concat([scores, scores.iloc[[0]]], ignore_index=True)
+    elif problem in {"nan", "inf"}:
+        scores.loc[0, "relative_score"] = np.nan if problem == "nan" else np.inf
+    elif problem == "metadata":
+        scores.loc[0, "seed"] = 99
+    else:
+        scores.loc[0, "partition"] = "reference"
+    with pytest.raises(PipelineError, match="Track B"):
+        evaluate_capture(**capture_case, track_b_scores=scores)
+
+
+def test_capture_rejects_two_models_claiming_the_same_ratio_seed(capture_case):
+    scores = track_b_frame(capture_case)
+    scores.loc[scores.model_id.eq("track_b_r10_s43"), "seed"] = 42
+    with pytest.raises(PipelineError, match="Track B"):
+        evaluate_capture(**capture_case, track_b_scores=scores)
+
+
+def test_cli_loads_and_hashes_optional_track_b_input(tmp_path, capture_case):
+    import shutil
+
+    root = Path(__file__).resolve().parents[2]
+    shutil.copytree(root / "configs", tmp_path / "configs")
+    for name in ("scores", "roads", "confirmed_event_segments", "partitions"):
+        frame = capture_case[name].copy()
+        if name == "confirmed_event_segments":
+            frame["affected_geometry"] = frame.affected_geometry.map(lambda g: g.wkb)
+        frame.to_parquet(tmp_path / f"{name}.parquet")
+    track_b_frame(capture_case).to_parquet(tmp_path / "track_b.parquet")
+    arguments = ["--repo-root", str(tmp_path), "--output", "evaluation.json"]
+    for name in ("scores", "roads", "confirmed-event-segments", "partitions"):
+        arguments.extend([f"--{name}", f"{name.replace('-', '_')}.parquet"])
+    arguments.extend(["--track-b-scores", "track_b.parquet"])
+    cli = load_cli()
+    assert cli.main(arguments) == 0
+    result = json.loads((tmp_path / "evaluation.json").read_text())
+    assert result["status"] == "complete"
+    assert result["input_paths"]["track_b_scores"] == "track_b.parquet"
+    assert len(result["input_hashes"]["track_b_scores"]) == 64
+    assert len(result["methods"]["track_b"]) == 3
+    # The new input participates in the existing preflight alias protection.
+    before = (tmp_path / "track_b.parquet").read_bytes()
+    arguments[arguments.index("--output") + 1] = "track_b.parquet"
+    assert cli.main(arguments) == 1
+    assert (tmp_path / "track_b.parquet").read_bytes() == before
+
+
 def load_cli():
     path = Path(__file__).resolve().parents[2] / "scripts/evaluate.py"
     spec = importlib.util.spec_from_file_location("evaluate_cli", path)

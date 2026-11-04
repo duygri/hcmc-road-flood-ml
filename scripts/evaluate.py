@@ -39,6 +39,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument(
             f"--{name}", required=True, help="Repository-relative derived input"
         )
+    parser.add_argument(
+        "--track-b-scores", help="Optional relative Track B score input"
+    )
     args = parser.parse_args(argv)
     try:
         settings = load_settings(args.config, repo_root=args.repo_root)
@@ -48,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
             name: getattr(args, name)
             for name in ("scores", "roads", "confirmed_event_segments", "partitions")
         }
+        if args.track_b_scores is not None:
+            inputs["track_b_scores"] = args.track_b_scores
         paths = {
             name: resolve_output(settings.repo_root, value)
             for name, value in inputs.items()
@@ -102,7 +107,14 @@ def main(argv: list[str] | None = None) -> int:
             else gpd.read_file(paths["roads"])
         )
         report = evaluate_capture(
-            scores, roads, links, partitions, settings.experiments
+            scores,
+            roads,
+            links,
+            partitions,
+            settings.experiments,
+            track_b_scores=pd.read_parquet(paths["track_b_scores"])
+            if "track_b_scores" in paths
+            else None,
         )
         if hashes != {name: _hash_file(path) for name, path in paths.items()}:
             raise PipelineError("Derived evaluation inputs changed during evaluation")

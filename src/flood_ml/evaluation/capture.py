@@ -25,6 +25,7 @@ Only completely covered reviewed events enter the shared capture denominator.
 
 import math
 from collections import Counter
+from itertools import combinations
 
 import geopandas as gpd
 import numpy as np
@@ -416,12 +417,148 @@ def _bootstrap_indices(gate, events):
     return draws
 
 
+def _track_b_table(scores, partitions):
+    columns = {
+        KEY,
+        "model_id",
+        "background_ratio",
+        "seed",
+        "relative_score",
+        "partition",
+    }
+    if (
+        not isinstance(scores, pd.DataFrame)
+        or scores.columns.duplicated().any()
+        or not columns.issubset(scores)
+    ):
+        raise PipelineError("Track B scores require the long-form score schema")
+    table = scores[sorted(columns)].copy()
+    if (
+        not table[KEY].map(_text).all()
+        or not table.model_id.map(_text).all()
+        or table.duplicated([KEY, "model_id"]).any()
+    ):
+        raise PipelineError("Track B requires nonblank IDs and unique road/model pairs")
+    for column, minimum in (("background_ratio", 1), ("seed", 0)):
+        if (
+            not table[column]
+            .map(
+                lambda value, lower=minimum: (
+                    isinstance(value, (int, np.integer))
+                    and not isinstance(value, (bool, np.bool_))
+                    and value >= lower
+                )
+            )
+            .all()
+        ):
+            raise PipelineError("Track B ratio and seed must be valid integers")
+    if (
+        table.groupby("model_id")[["background_ratio", "seed"]]
+        .nunique()
+        .ne(1)
+        .any()
+        .any()
+    ):
+        raise PipelineError("Track B model IDs require consistent ratio and seed")
+    if (
+        table.groupby("model_id")[["background_ratio", "seed"]]
+        .first()
+        .duplicated()
+        .any()
+    ):
+        raise PipelineError("Track B ratio/seed draws must have distinct model IDs")
+    table["relative_score"] = pd.to_numeric(table.relative_score, errors="coerce")
+    if not np.isfinite(table.relative_score).all():
+        raise PipelineError("Track B relative scores must be finite")
+    partition_map = partitions.set_index(KEY).partition
+    if (
+        not table.partition.eq("holdout").all()
+        or not table[KEY].map(partition_map).eq("holdout").all()
+    ):
+        raise PipelineError("Track B scores must agree with frozen holdout partitions")
+    return table.sort_values(["model_id", KEY]).reset_index(drop=True)
+
+
+def _track_b_coverage(scores, population):
+    required = set(population[KEY])
+    models = {}
+    for model_id, rows in scores.groupby("model_id", sort=True):
+        missing = sorted(required - set(rows[KEY]))
+        models[model_id] = {
+            "status": "pending" if missing else "ready",
+            "background_ratio": int(rows.background_ratio.iloc[0]),
+            "seed": int(rows.seed.iloc[0]),
+            "eligible_road_count": len(required & set(rows[KEY])),
+            "missing_road_segment_ids": missing,
+        }
+    return {
+        "status": "ready"
+        if models and all(model["status"] == "ready" for model in models.values())
+        else "pending",
+        "required_road_count": len(required),
+        "required_road_length_m": float(population.road_length_m.sum()),
+        "model_count": len(models),
+        "models": models,
+    }
+
+
+def _distribution(values):
+    defined = [value for value in values if value is not None]
+    q25, median, q75 = (
+        [float(value) for value in np.quantile(defined, [0.25, 0.5, 0.75])]
+        if defined
+        else (None, None, None)
+    )
+    return {
+        "median": median,
+        "q25": q25,
+        "q75": q75,
+        "iqr": q75 - q25 if defined else None,
+        "defined_draws": len(defined),
+        "undefined_draws": len(values) - len(defined),
+    }
+
+
+def _track_b_stability(models):
+    by_ratio = {}
+    for ratio in sorted({model["background_ratio"] for model in models.values()}):
+        draws = [
+            model for model in models.values() if model["background_ratio"] == ratio
+        ]
+        top_k = {}
+        for fraction in FRACTIONS:
+            metrics = [model["top_k"][str(fraction)] for model in draws]
+            selected = [set(metric["selected_road_segment_ids"]) for metric in metrics]
+            overlaps = [
+                len(first & second) / len(first | second) if first | second else None
+                for first, second in combinations(selected, 2)
+            ]
+            top_k[str(fraction)] = {
+                **{
+                    field: _distribution([metric[field] for metric in metrics])
+                    for field in ("capture", "capture_any", "capture_all", "lift")
+                },
+                "mean_pairwise_jaccard": _rate(
+                    [value for value in overlaps if value is not None]
+                ),
+                "pair_count": len(overlaps),
+            }
+        by_ratio[str(ratio)] = {
+            "model_count": len(draws),
+            "seeds": sorted(model["seed"] for model in draws),
+            "top_k": top_k,
+        }
+    return {"by_background_ratio": by_ratio}
+
+
 def evaluate_capture(
     scores: pd.DataFrame,
     roads: gpd.GeoDataFrame,
     confirmed_event_segments: pd.DataFrame,
     partitions: pd.DataFrame,
     config: dict,
+    *,
+    track_b_scores: pd.DataFrame | None = None,
 ) -> dict:
     """Return pending without metrics, or conditional reviewed holdout capture.
 
@@ -434,6 +571,11 @@ def evaluate_capture(
     """
     rules = _rules(config)
     gate = evaluation_gate(confirmed_event_segments, partitions)
+    track_b = (
+        _track_b_table(track_b_scores, partitions)
+        if track_b_scores is not None
+        else None
+    )
     report = {
         "status": gate["status"],
         "evaluation_performed": False,
@@ -523,6 +665,12 @@ def evaluate_capture(
     )
     if final_gate["status"] != "ready":
         return report
+    if track_b is not None:
+        coverage = _track_b_coverage(track_b, table)
+        report["track_b_coverage"] = coverage
+        if coverage["status"] != "ready":
+            report["status"] = "pending_track_b_coverage"
+            return report
     geometry = roads.set_index(KEY).geometry
     event_ids = [event["event_group_id"] for event in events]
     methods, captures = {}, {}
@@ -569,6 +717,22 @@ def evaluate_capture(
         )
         methods[name] = {"eligible_road_length_m": denominator, "top_k": budgets}
         captures[name] = outcomes
+    track_b_methods, track_b_captures = {}, {}
+    if track_b is not None:
+        for model_id, rows in track_b.groupby("model_id", sort=True):
+            ranked = table.merge(
+                rows[[KEY, "relative_score"]], on=KEY, validate="one_to_one"
+            ).sort_values(
+                ["relative_score", KEY], ascending=[False, True], kind="stable"
+            )
+            budgets, outcomes = evaluate_order(ranked)
+            track_b_methods[model_id] = {
+                "background_ratio": int(rows.background_ratio.iloc[0]),
+                "seed": int(rows.seed.iloc[0]),
+                "eligible_road_length_m": denominator,
+                "top_k": budgets,
+            }
+            track_b_captures[model_id] = outcomes
     random_runs, random_outcomes = [], []
     for seed in range(42, 142):
         ordered = table.iloc[np.random.default_rng(seed).permutation(len(table))]
@@ -603,7 +767,13 @@ def evaluate_capture(
         "top_k": random_summary,
     }
     draws = _bootstrap_indices(gate, events)
-    for name, method in methods.items():
+    ranked_methods = [
+        (name, method, captures[name], False) for name, method in methods.items()
+    ] + [
+        (name, method, track_b_captures[name], True)
+        for name, method in track_b_methods.items()
+    ]
+    for name, method, method_captures, is_track_b in ranked_methods:
         for fraction in FRACTIONS:
             key = str(fraction)
             metric = method["top_k"][key]
@@ -615,9 +785,20 @@ def evaluate_capture(
                     metric["capture"],
                     methods["elevation_only"]["top_k"][key]["capture"],
                 )
+            if is_track_b:
+                for baseline in ("mcda", "elevation_only"):
+                    baseline_rate = methods[baseline]["top_k"][key]["capture"]
+                    metric[f"lift_vs_{baseline}"] = _ratio(
+                        metric["capture"], baseline_rate
+                    )
+                    metric[f"capture_difference_vs_{baseline}"] = (
+                        metric["capture"] - baseline_rate
+                        if metric["capture"] is not None and baseline_rate is not None
+                        else None
+                    )
             rates, any_rates, all_rates, lifts = [], [], [], []
             for sample in draws:
-                outcomes = captures[name][key][sample]
+                outcomes = method_captures[key][sample]
                 random_sample = captures["random"][key][sample]
                 rate = _rate(outcomes[:, 0])
                 rates.append(rate)
@@ -635,6 +816,9 @@ def evaluate_capture(
                 "capture_all_ci95": _ci(all_rates),
                 "lift_ci95": _ci(lifts),
             }
+    if track_b is not None:
+        methods["track_b"] = track_b_methods
+        report["track_b_stability"] = _track_b_stability(track_b_methods)
     report.update(
         status="complete",
         evaluation_performed=True,

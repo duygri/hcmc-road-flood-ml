@@ -85,6 +85,28 @@ def fixture_run(root: Path, *, track_b_status="pending_positive_review") -> Path
     return root
 
 
+def ready_track_b(repo: Path, *, extra_output: str | None = None) -> None:
+    score = repo / f"data/processed/{RUN_ID}/track_b_scores.parquet"
+    model = repo / f"artifacts/{RUN_ID}/model.joblib"
+    score.write_bytes(b"scores")
+    model.write_bytes(b"model")
+    report_path = repo / f"reports/runs/{RUN_ID}/track_b.json"
+    report = json.loads(report_path.read_text())
+    report.update(
+        status="ready",
+        output_hashes={
+            f"data/processed/{RUN_ID}/track_b_scores.parquet": "scorehash",
+            f"artifacts/{RUN_ID}/model.joblib": "modelhash",
+        },
+        draws=[
+            {"status": "fitted", "model_artifact": f"artifacts/{RUN_ID}/model.joblib"}
+        ],
+    )
+    if extra_output:
+        report["output_hashes"][extra_output] = "extrahash"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+
 def test_publisher_copies_required_run_outputs_and_records_hashes(tmp_path):
     repo = fixture_run(tmp_path / "repo")
     published = publish_run(repo, tmp_path / "drive", RUN_ID)
@@ -139,6 +161,54 @@ def test_publisher_requires_ready_track_b_artifacts(tmp_path):
     with pytest.raises(PipelineError, match="Track B.*artifact|track_b.*artifact"):
         publish_run(repo, tmp_path / "drive", RUN_ID)
     assert not (tmp_path / "drive/runs" / RUN_ID / "completion_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "extra_output",
+    [
+        f"data/interim/{RUN_ID}/roads.gpkg",
+        "artifacts/another_run/model.joblib",
+    ],
+)
+def test_publisher_rejects_ready_track_b_artifacts_outside_selected_run_roots(
+    tmp_path, extra_output
+):
+    repo = fixture_run(tmp_path / "repo")
+    ready_track_b(repo, extra_output=extra_output)
+    if "another_run" in extra_output:
+        other_run_artifact = repo / extra_output
+        other_run_artifact.parent.mkdir(parents=True)
+        other_run_artifact.write_bytes(b"other run")
+    with pytest.raises(PipelineError, match="outside selected run outputs"):
+        publish_run(repo, tmp_path / "drive", RUN_ID)
+    assert not (tmp_path / "drive/runs" / RUN_ID).exists()
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("git", "commit"), None),
+        (("lock_sha256",), None),
+        (("config_hash",), None),
+        (("input_hashes",), {}),
+    ],
+)
+def test_publisher_rejects_missing_required_provenance_before_creating_target(
+    tmp_path, field_path, replacement
+):
+    repo = fixture_run(tmp_path / "repo")
+    path = repo / f"reports/runs/{RUN_ID}/run.json"
+    record = json.loads(path.read_text())
+    section, *keys = field_path
+    if keys:
+        record[section][keys[0]] = replacement
+    else:
+        record[section] = replacement
+    path.write_text(json.dumps(record), encoding="utf-8")
+    target = tmp_path / "drive/runs" / RUN_ID
+    with pytest.raises(PipelineError, match="provenance"):
+        publish_run(repo, tmp_path / "drive", RUN_ID)
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("failure", ["copy", "hash"])

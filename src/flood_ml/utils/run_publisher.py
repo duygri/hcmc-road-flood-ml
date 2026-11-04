@@ -35,21 +35,41 @@ def _transient(path: Path) -> bool:
     )
 
 
-def _manifest_required_files(root: Path, track_b: dict) -> set[Path]:
+def _manifest_required_files(
+    root: Path, track_b: dict, source_roots: dict[str, Path]
+) -> set[Path]:
     required = set()
     if track_b.get("status") == "ready":
         output_hashes = track_b.get("output_hashes") or {}
+        if not isinstance(output_hashes, dict):
+            raise PipelineError("Ready Track B output hashes must be a mapping")
         paths = set(output_hashes)
         for draw in track_b.get("draws", []):
             if draw.get("status") == "fitted" and draw.get("model_artifact"):
                 paths.add(draw["model_artifact"])
+        if any(not isinstance(value, str) for value in paths):
+            raise PipelineError(
+                "Ready Track B report contains an invalid artifact path"
+            )
         score_paths = [p for p in paths if "track_b_scores" in p]
-        if not score_paths or not any(p for p in paths if p.endswith(".joblib")):
+        if not score_paths or not any(p.endswith(".joblib") for p in paths):
             raise PipelineError(
                 "Ready Track B report must declare its score and model artifacts"
             )
         for value in paths:
-            required.add(resolve_output(root, value))
+            path = resolve_output(root, value)
+            if not any(
+                path.is_relative_to(source_root)
+                for source_root in source_roots.values()
+            ):
+                raise PipelineError(
+                    f"Track B artifact is outside selected run outputs: {value}"
+                )
+            if _transient(path) or path.is_symlink():
+                raise PipelineError(f"Track B artifact is transient or linked: {value}")
+            if not path.is_file():
+                raise PipelineError(f"Required Track B artifact is missing: {value}")
+            required.add(path)
     elif track_b.get("status") not in {
         "pending_positive_review",
         "background_pool_insufficient",
@@ -117,11 +137,34 @@ def publish_run(
         )
     if run_record.get("run_id") != run_id:
         raise PipelineError("Run provenance is for another run")
+    git_record = run_record.get("git")
+    input_hashes = run_record.get("input_hashes")
+    if (
+        not isinstance(git_record, dict)
+        or not isinstance(git_record.get("commit"), str)
+        or not git_record["commit"].strip()
+        or not isinstance(run_record.get("lock_sha256"), str)
+        or not run_record["lock_sha256"].strip()
+        or not isinstance(run_record.get("config_hash"), str)
+        or not run_record["config_hash"].strip()
+        or not isinstance(input_hashes, dict)
+        or not input_hashes
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(digest, str)
+            or not digest
+            for name, digest in input_hashes.items()
+        )
+    ):
+        raise PipelineError(
+            "Run provenance is missing required commit, lock/config hashes, or input hashes"
+        )
     if pipeline.get("pipeline_status") != "complete":
         raise PipelineError("Pipeline report does not declare a complete run")
     if not evaluation.get("status") or not pipeline.get("evaluation_status"):
         raise PipelineError("Evaluation gate status is missing")
-    extra_required = _manifest_required_files(repo_root, track_b)
+    extra_required = _manifest_required_files(repo_root, track_b, source_roots)
     files = []
     for source_root in source_roots.values():
         if not source_root.is_dir():
@@ -140,9 +183,10 @@ def publish_run(
     ]
     if absent:
         raise PipelineError(f"Required run output is missing: {absent[0]}")
-    for path in extra_required:
-        if path not in files:
-            files.append(path)
+    if any(path not in files for path in extra_required):
+        raise PipelineError(
+            "A declared Track B artifact is outside selected run outputs"
+        )
     selected_size = sum(path.stat().st_size for path in files)
     try:
         local_free = shutil.disk_usage(repo_root).free

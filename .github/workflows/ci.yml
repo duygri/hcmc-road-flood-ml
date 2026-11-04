@@ -8,14 +8,22 @@ permissions:
   contents: read
 
 jobs:
-  synthetic-windows:
-    runs-on: windows-latest
+  synthetic:
+    name: Synthetic checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
+          version: "0.13.6"
           python-version: "3.12"
           enable-cache: false
+      - name: Check lockfile
+        run: uv lock --check
       - name: Install locked dependencies
         run: uv sync --locked --group dev
       - name: Lint

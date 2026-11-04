@@ -50,11 +50,13 @@ _VOLATILE = {
 }
 
 
-def _canonical(value, snapshot):
+def _canonical(value, snapshot, *, repo_root=None):
     """Normalize only configured runtime roots; retain all effective settings."""
     sources = snapshot.get("sources", {})
     labeling = snapshot.get("labeling", {})
     roots = []
+    if repo_root:
+        roots.append((str(repo_root).replace("\\", "/").rstrip("/"), "<REPO_ROOT>"))
     if sources.get("raw_root"):
         roots.append(
             (str(sources["raw_root"]).replace("\\", "/").rstrip("/"), "<RAW_ROOT>")
@@ -310,6 +312,7 @@ def compare_runs(
     report_relative = f"{settings.experiments['outputs']['reports']}/{run_id}"
     manifest = _read_json(published_run / "completion_manifest.json")
     differences, hashes = [], {}
+    derived_artifact_hashes = {}
     records = {
         side: {
             name: _read_json(root / report_relative / f"{name}.json")
@@ -506,13 +509,52 @@ def compare_runs(
                 "runtime.json",
                 "local_verification.json",
             }:
+                reports = []
+                for side, path in (("published", published), ("local", local)):
+                    # The run snapshot anchors raw/review/output identities. The
+                    # evaluation CLI additionally records its original checkout
+                    # root; normalize that prefix while retaining every suffix.
+                    evaluation_snapshot = records[side]["evaluation"].get(
+                        "config_snapshot", {}
+                    )
+                    repo_root = evaluation_snapshot.get("repo_root")
+                    report = _read_json(path)
+                    if path.name in {"evaluation.json", "track_b.json"}:
+                        # These hashes describe serialized derived tables/models,
+                        # whose semantic values are checked separately. Preserve
+                        # the hashes for traceability and compare input roles.
+                        derived_artifact_hashes.setdefault(relative, {})[side] = {
+                            key: report[key]
+                            for key in (
+                                "input_hashes",
+                                "partition_sha256",
+                                "output_hashes",
+                            )
+                            if key in report
+                        }
+                        if isinstance(report.get("input_hashes"), dict):
+                            report["input_hashes"] = dict.fromkeys(
+                                report["input_hashes"]
+                            )
+                        if "partition_sha256" in report:
+                            report["partition_sha256"] = None
+                    reports.append(
+                        _canonical(
+                            _semantic_report(report),
+                            records[side]["run"].get("config_snapshot") or {},
+                            repo_root=repo_root,
+                        )
+                    )
+                # Configuration settings are exact even inside numeric reports.
                 _compare_json(
-                    _semantic_report(_read_json(published)),
-                    _semantic_report(_read_json(local)),
-                    relative,
+                    reports[0].pop("config_snapshot", None),
+                    reports[1].pop("config_snapshot", None),
+                    f"{relative}.config_snapshot",
                     differences,
                     atol,
+                    tolerant=False,
                 )
+                _compare_json(reports[0], reports[1], relative, differences, atol)
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
             differences.append(
                 {
@@ -578,5 +620,6 @@ def compare_runs(
         "gate_statuses": gates,
         "provenance": provenance,
         "file_hashes": hashes,
+        "derived_artifact_hashes": derived_artifact_hashes,
         "differences": differences,
     }

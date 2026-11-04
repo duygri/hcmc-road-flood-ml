@@ -436,3 +436,168 @@ def test_compare_runs_rejects_geopackage_declared_schema_changes_with_identical_
     )
     assert difference["file"].endswith("roads.gpkg:roads")
     assert difference["published"] != difference["local"]
+
+
+def test_compare_runs_normalizes_real_evaluation_cli_paths_without_hiding_settings(
+    tmp_path,
+):
+    import hashlib
+    import shutil
+    from dataclasses import asdict
+
+    import geopandas as gpd
+    import yaml
+    from shapely.geometry import LineString
+
+    from flood_ml.config import load_settings
+    from flood_ml.labeling.reviews import LINK_COLUMNS
+    from flood_ml.utils.run import _snapshot
+
+    colab = fixture_run(tmp_path / "colab_checkout")
+    processed = colab / f"data/processed/{RUN_ID}"
+    roads = gpd.GeoDataFrame(
+        {"road_segment_id": ["r1"]},
+        geometry=[LineString([(0, 0), (1, 1)])],
+        crs="EPSG:32648",
+    )
+    roads.to_parquet(processed / "road_features.parquet")
+    pd.DataFrame(
+        {
+            "road_segment_id": ["r1"],
+            "score": [0.5],
+            "elevation_median_m": [1.0],
+            "mcda_eligible": [True],
+        }
+    ).to_parquet(processed / "road_susceptibility.parquet")
+    pd.DataFrame(
+        {"road_segment_id": ["r1"], "block_id": ["b1"], "partition": ["reference"]}
+    ).to_parquet(processed / "road_partitions.parquet")
+    pd.DataFrame(columns=LINK_COLUMNS).to_parquet(
+        processed / "confirmed_event_segments.parquet"
+    )
+    (colab / f"artifacts/{RUN_ID}/normalizer.json").write_text('{"q05": 1.0}')
+    (colab / "uv.lock").write_text("same lock")
+    local_configs = colab / "configs/local"
+    local_configs.mkdir()
+    (local_configs / "review_decisions.csv").write_text("same reviewed snapshot")
+    local = tmp_path / "local_checkout"
+    shutil.copytree(colab, local)
+    script = Path(__file__).parents[2] / "scripts/evaluate.py"
+    snapshots = []
+    for root in (colab, local):
+        (root / "configs/local/sources.yaml").write_text(
+            yaml.safe_dump(
+                {"sources": {"raw_root": str(tmp_path / f"raw_{root.name}")}}
+            )
+        )
+        settings = load_settings(Path("configs/experiments.yaml"), repo_root=root)
+        snapshot = _snapshot(asdict(settings))
+        snapshots.append(snapshot)
+        update(
+            root,
+            "run",
+            manifest_sha256="manifest",
+            code_sha256="source",
+            config_snapshot={
+                key: value
+                for key, value in snapshot.items()
+                if key not in {"repo_root", "configuration_paths"}
+            },
+            review_hashes={
+                "match_reviews": hashlib.sha256(b"same reviewed snapshot").hexdigest()
+            },
+        )
+        args = [
+            sys.executable,
+            str(script),
+            "--repo-root",
+            str(root),
+            "--run-id",
+            RUN_ID,
+        ]
+        for option, filename in (
+            ("scores", "road_susceptibility.parquet"),
+            ("roads", "road_features.parquet"),
+            ("confirmed-event-segments", "confirmed_event_segments.parquet"),
+            ("partitions", "road_partitions.parquet"),
+        ):
+            args.extend([f"--{option}", f"data/processed/{RUN_ID}/{filename}"])
+        result = subprocess.run(args, check=False, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    assert snapshots[0]["repo_root"] != snapshots[1]["repo_root"]
+    assert snapshots[0]["sources"]["raw_root"] != snapshots[1]["sources"]["raw_root"]
+    assert snapshots[0]["configuration_paths"] != snapshots[1]["configuration_paths"]
+    published = publish_run(colab, tmp_path / "drive", RUN_ID)
+    report = compare_runs(published, local, RUN_ID)
+    assert report["equivalent"], report["differences"]
+    evaluation_path = local / f"reports/runs/{RUN_ID}/evaluation.json"
+    original = json.loads(evaluation_path.read_text())
+    changed = json.loads(json.dumps(original))
+    changed["config_snapshot"]["experiments"]["evaluation"][
+        "primary_capture_fraction"
+    ] += 1e-6
+    evaluation_path.write_text(json.dumps(changed))
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+    changed = json.loads(json.dumps(original))
+    changed["config_snapshot"]["labeling"]["match_reviews"] = (
+        "configs/local/other_review.csv"
+    )
+    evaluation_path.write_text(json.dumps(changed))
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+    changed = json.loads(json.dumps(original))
+    changed["config_snapshot"]["sources"]["raw_root"] = str(tmp_path / "unrecorded_raw")
+    evaluation_path.write_text(json.dumps(changed))
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+    changed = json.loads(json.dumps(original))
+    changed["config_snapshot"]["configuration_paths"][0] = str(
+        local / "configs/other.yaml"
+    )
+    evaluation_path.write_text(json.dumps(changed))
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+    evaluation_path.write_text(json.dumps(original))
+    update(local, "run", review_hashes={"match_reviews": "different_review_content"})
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+
+
+def test_compare_runs_keeps_derived_report_hashes_as_traceability_only(runs):
+    published, local = runs
+    for side, root in (("colab", published), ("local", local)):
+        update(
+            root,
+            "evaluation",
+            input_hashes={"scores": f"{side}_parquet", "roads": f"{side}_gpkg"},
+        )
+        update(
+            root,
+            "track_b",
+            input_hashes={
+                "features": f"{side}_features",
+                "partitions": f"{side}_partitions",
+            },
+            partition_sha256=f"{side}_partitions",
+            output_hashes={"model.joblib": f"{side}_model"},
+        )
+    refresh(published)
+    report = compare_runs(published, local, RUN_ID)
+    assert report["equivalent"], report["differences"]
+    evaluation = report["derived_artifact_hashes"][
+        f"reports/runs/{RUN_ID}/evaluation.json"
+    ]
+    assert evaluation["published"]["input_hashes"]["roads"] == "colab_gpkg"
+    assert evaluation["local"]["input_hashes"]["roads"] == "local_gpkg"
+    track_b = report["derived_artifact_hashes"][f"reports/runs/{RUN_ID}/track_b.json"]
+    assert track_b["published"]["partition_sha256"] == "colab_partitions"
+    assert track_b["local"]["partition_sha256"] == "local_partitions"
+    assert track_b["local"]["output_hashes"]["model.joblib"] == "local_model"
+    update(local, "evaluation", input_hashes={"scores": "local_parquet"})
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+    update(
+        local,
+        "evaluation",
+        input_hashes={"scores": "local_parquet", "roads": "local_gpkg"},
+    )
+    alter(local, lambda f: f.assign(feature=9.0))
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]
+    alter(local, lambda f: f.assign(feature=[2.0, 1.0]))
+    update(local, "run", input_hashes={"input": "different_raw_snapshot"})
+    assert not compare_runs(published, local, RUN_ID)["equivalent"]

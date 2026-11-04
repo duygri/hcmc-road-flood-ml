@@ -1,0 +1,96 @@
+experiments:
+  run_id: hcmc_old_v1_001
+  seed: 42
+  configs:
+    sources: configs/sources.yaml
+    study_area: configs/study_area.yaml
+    features: configs/features.yaml
+    labeling: configs/labeling.yaml
+  outputs:
+    interim: data/interim
+    processed: data/processed
+    reports: reports/runs
+    artifacts: artifacts
+  spatial_block_m: 5000
+  holdout_fraction: 0.2
+  guard_m: 1000
+  evaluation:
+    # Independent reviewed events, never source records; frozen blocks stay fixed.
+    minimum_reference_events: 20
+    minimum_holdout_events: 20
+    minimum_holdout_blocks: 3
+    minimum_events_per_holdout_block: 5
+    top_k_length_fractions: [0.01, 0.05, 0.1, 0.2]
+    primary_capture_fraction: 0.5
+    sensitivity_capture: [any, 1.0]
+    # Human-reviewed complete affected geometry and full common score coverage.
+    minimum_affected_score_coverage: 1.0
+    random_seed_start: 42
+    random_repetitions: 100
+    bootstrap_seed: 42
+    bootstrap_repetitions: 1000
+  track_b:
+    # Reviewed reference positives vs sampled unknown background; relative scores.
+    feature_columns:
+      - elevation_median_m
+      - relative_elevation_m
+      - slope_mean_deg
+      - dist_water_m
+      - builtup_ratio_250m
+    primary_background_ratio: 10
+    sensitivity_background_ratios: [5, 20]
+    seed_start: 42
+    seed_repetitions: 20
+    minimum_reference_events: 20
+    logistic_regression:
+      C: 1.0
+      max_iter: 1000
+  mcda:
+    # Predeclared hypothesis; no fitting or selection against flood labels.
+    feature_spec:
+      - name: elevation_median_m
+        direction: lower_is_higher_risk
+      - name: relative_elevation_m
+        direction: lower_is_higher_risk
+      - name: slope_mean_deg
+        direction: lower_is_higher_risk
+      - name: dist_water_m
+        direction: lower_is_higher_risk
+      - name: builtup_ratio_250m
+        direction: higher_is_higher_risk
+    normalization: q05_q95_linear_clip
+    constant_reference_contribution: 0.5
+    missing_policy: null_score_no_weight_redistribution
+    primary_weight_set: equal
+    top_k_length_fractions: [0.01, 0.05, 0.1, 0.2]
+    weight_sets:
+      equal:
+        elevation_median_m: 0.2
+        relative_elevation_m: 0.2
+        slope_mean_deg: 0.2
+        dist_water_m: 0.2
+        builtup_ratio_250m: 0.2
+      terrain-heavy:
+        elevation_median_m: 0.15
+        relative_elevation_m: 0.4
+        slope_mean_deg: 0.15
+        dist_water_m: 0.15
+        builtup_ratio_250m: 0.15
+      water-heavy:
+        elevation_median_m: 0.15
+        relative_elevation_m: 0.15
+        slope_mean_deg: 0.15
+        dist_water_m: 0.4
+        builtup_ratio_250m: 0.15
+      builtup-heavy:
+        elevation_median_m: 0.15
+        relative_elevation_m: 0.15
+        slope_mean_deg: 0.15
+        dist_water_m: 0.15
+        builtup_ratio_250m: 0.4
+  # Frozen origin-(0,0) metric grid; midpoint gives one block per road.
+  # Holdout iff SHA-256("seed:block_id") / 2**256 < holdout_fraction.
+  # No label, score or event quota changes block selection. Full lines are
+  # guarded against selected blocks AND holdout lines (including extensions).
+  # Effective guard = max(guard_m, 2 * max(configured feature buffer radii)).
+  # Pass both experiments and features sections to assign_spatial_partitions.

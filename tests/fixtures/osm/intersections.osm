@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="synthetic-test-fixture">
+  <!-- Synthetic topology only; metric lengths are tested independently in EPSG:9210. -->
+  <node id="1" lat="10.7000" lon="106.7000"/>
+  <node id="2" lat="10.7000" lon="106.7010"/>
+  <node id="3" lat="10.7000" lon="106.7020"/>
+  <node id="4" lat="10.7008" lon="106.7010"/>
+  <node id="5" lat="10.7020" lon="106.7000"/>
+  <node id="6" lat="10.7020" lon="106.7010"/>
+  <node id="7" lat="10.7020" lon="106.7020"/>
+  <node id="8" lat="10.7010" lon="106.7010"/>
+  <node id="9" lat="10.7020" lon="106.7010"/>
+  <node id="12" lat="10.7030" lon="106.7010"/>
+  <node id="13" lat="10.7040" lon="106.7000"/>
+  <node id="14" lat="10.7040" lon="106.7010"/>
+  <node id="15" lat="10.7040" lon="106.7020"/>
+  <node id="16" lat="10.7032" lon="106.7010"/>
+  <node id="17" lat="10.7048" lon="106.7010"/>
+  <node id="18" lat="10.7060" lon="106.6800"/>
+  <node id="19" lat="10.7060" lon="106.7300"/>
+  <!-- Approximately 450 m and 40 m at HCMC latitude. -->
+  <node id="20" lat="10.7070" lon="106.7000"/>
+  <node id="21" lat="10.7070" lon="106.704112"/>
+  <node id="22" lat="10.7080" lon="106.7000"/>
+  <node id="23" lat="10.7080" lon="106.7003655"/>
+  <node id="24" lat="12.0" lon="108.0"/>
+  <node id="25" lat="12.001" lon="108.0"/>
+  <way id="10"><nd ref="1"/><nd ref="2"/><nd ref="3"/><tag k="highway" v="residential"/><tag k="name" v="T main"/></way>
+  <way id="11"><nd ref="2"/><nd ref="4"/><tag k="highway" v="residential"/></way>
+  <way id="20"><nd ref="5"/><nd ref="6"/><nd ref="7"/><tag k="highway" v="primary"/></way>
+  <way id="21"><nd ref="8"/><nd ref="9"/><nd ref="12"/><tag k="highway" v="residential"/></way>
+  <way id="30"><nd ref="13"/><nd ref="14"/><nd ref="15"/><tag k="highway" v="primary"/><tag k="bridge" v="yes"/><tag k="layer" v="1"/></way>
+  <way id="31"><nd ref="16"/><nd ref="14"/><tag k="highway" v="residential"/><tag k="layer" v="0"/></way>
+  <way id="32"><nd ref="17"/><nd ref="14"/><tag k="highway" v="residential"/><tag k="tunnel" v="yes"/><tag k="layer" v="-1"/></way>
+  <way id="40"><nd ref="18"/><nd ref="19"/><tag k="highway" v="primary"/></way>
+  <way id="50"><nd ref="20"/><nd ref="21"/><tag k="highway" v="residential"/></way>
+  <way id="60"><nd ref="22"/><nd ref="23"/><tag k="highway" v="residential"/></way>
+  <way id="99"><nd ref="1"/><nd ref="4"/><tag k="highway" v="footway"/></way>
+  <way id="100"><nd ref="24"/><nd ref="25"/><tag k="highway" v="residential"/></way>
+</osm>

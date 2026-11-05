@@ -16,6 +16,7 @@ import yaml
 from sklearn.pipeline import Pipeline
 
 from flood_ml.config import PipelineError, load_settings
+from flood_ml.utils.wandb_tracking import log_stage_report
 
 ROOT = Path(__file__).parents[2]
 FEATURES = [
@@ -34,6 +35,12 @@ RULES = {
     "minimum_reference_events": 20,
     "logistic_regression": {"C": 1.0, "max_iter": 1000},
 }
+
+
+@pytest.fixture(autouse=True)
+def disable_remote_tracking(monkeypatch):
+    """Existing subprocess tests must never inherit real tracking credentials."""
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
 
 
 def fixture_repo(root, *, reviewed=True, unknowns=400):
@@ -403,3 +410,135 @@ def test_train_cli_backup_cleanup_failure_keeps_ready_report_and_outputs(
     assert isinstance(joblib.load(models[0]), Pipeline)
     for path, expected in payload["output_hashes"].items():
         assert hashlib.sha256((tmp_path / path).read_bytes()).hexdigest() == expected
+
+
+@pytest.mark.parametrize(
+    "reviewed,unknowns,status,reviewed_events,failed_draws",
+    [
+        (True, 400, "ready", 20, 0),
+        (False, 400, "pending_positive_review", 0, 0),
+        (True, 100, "background_pool_insufficient", 20, 40),
+    ],
+)
+@pytest.mark.parametrize("tracking", ["logged", "skipped_no_api_key", "failed"])
+def test_train_cli_tracks_only_published_safe_metadata(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    reviewed,
+    unknowns,
+    status,
+    reviewed_events,
+    failed_draws,
+    tracking,
+):
+    fixture_repo(tmp_path, reviewed=reviewed, unknowns=unknowns)
+    spec = importlib.util.spec_from_file_location(
+        "track_b_train", ROOT / "scripts/train.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls, published = [], {}
+
+    def record_tracking(**kwargs):
+        # Tracking must observe the final report and every committed artifact.
+        payload = report(tmp_path)
+        assert payload["status"] == status
+        for path, expected in payload["output_hashes"].items():
+            assert (
+                hashlib.sha256((tmp_path / path).read_bytes()).hexdigest() == expected
+            )
+        published.update(
+            {
+                path: path.read_bytes()
+                for directory in ("reports", "artifacts", "data/processed")
+                for path in (tmp_path / directory).rglob("*")
+                if path.is_file()
+            }
+        )
+        calls.append(kwargs)
+        # Exercise the real optional sink for missing credentials/service failure.
+        if tracking != "logged":
+            return log_stage_report(**kwargs)
+        return "logged"
+
+    if tracking == "failed":
+        from types import SimpleNamespace
+
+        def fail_init(**_kwargs):
+            raise RuntimeError("synthetic remote failure")
+
+        monkeypatch.setenv("WANDB_API_KEY", "synthetic-key")
+        monkeypatch.setitem(
+            sys.modules,
+            "wandb",
+            SimpleNamespace(
+                Settings=lambda **kwargs: kwargs,
+                init=fail_init,
+            ),
+        )
+    monkeypatch.setattr(module, "log_stage_report", record_tracking, raising=False)
+    assert module.main(arguments(tmp_path)) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": status,
+        "run_id": "train_fixture",
+        "tracking_status": tracking,
+    }
+    assert len(calls) == 1
+    payload = report(tmp_path)
+    call = calls[0]
+    assert call["run_id"] == "train_fixture"
+    assert call["stage"] == "track-b"
+    assert call["config"] == {
+        "track_b": RULES,
+        "run_id": "train_fixture",
+        "source_commit": payload["git"]["commit"],
+        "config_hash": payload["config_hash"],
+        "lock_sha256": payload["lock_sha256"],
+        "code_sha256": payload["code_sha256"],
+        "model_versions": payload["model_versions"],
+    }
+    assert call["summary"] == {
+        "status": status,
+        "reviewed_reference_events": reviewed_events,
+        "reviewed_holdout_events": 0,
+        "feature_eligible_reference_events": reviewed_events,
+    }
+    expected_metrics = {
+        "feature_input": unknowns + 27,
+        "draws": 60,
+        "failed_draws": failed_draws,
+        "logistic_regression": {"C": 1.0, "max_iter": 1000},
+    }
+    if status == "ready":
+        expected_metrics.update(
+            fitted_models=60, scored_rows=120, scored_holdout_roads=2
+        )
+    else:
+        assert_no_fitted_outputs(tmp_path)
+    assert call["metrics"] == expected_metrics
+    assert not any("wandb" in key or "tracking" in key for key in payload)
+    assert published
+    assert {path: path.read_bytes() for path in published} == published
+
+
+def test_train_cli_does_not_track_failed_publication(tmp_path, monkeypatch):
+    fixture_repo(tmp_path, reviewed=False)
+    spec = importlib.util.spec_from_file_location(
+        "track_b_train", ROOT / "scripts/train.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+
+    def fail_publication(*_args):
+        raise OSError("synthetic publication failure")
+
+    monkeypatch.setattr(module, "_publish", fail_publication)
+    monkeypatch.setattr(
+        module, "log_stage_report", lambda **kwargs: calls.append(kwargs), raising=False
+    )
+    assert module.main(arguments(tmp_path)) == 1
+    assert report(tmp_path)["status"] == "failed"
+    assert calls == []
+    assert_no_fitted_outputs(tmp_path)

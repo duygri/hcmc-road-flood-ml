@@ -2,7 +2,9 @@
 
 import math
 import os
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 
 
 def _numeric_metrics(metrics: Mapping[str, object], prefix: str = "") -> dict:
@@ -43,7 +45,12 @@ def log_stage_report(
     try:
         import wandb
 
+        # Both stages share a portable run root outside the working checkout;
+        # SDK files must not affect the next stage's Git provenance snapshot.
+        run_root = Path(tempfile.gettempdir()) / "hcmc-road-flood-ml-wandb"
+        run_root.mkdir(parents=True, exist_ok=True)
         run = wandb.init(
+            dir=str(run_root),
             entity=os.environ.get("WANDB_ENTITY", "duygri-saigon-university-sgu-"),
             project=os.environ.get("WANDB_PROJECT", "hcmc-road-flood-ml"),
             name=f"{run_id}-{stage}",
@@ -58,6 +65,8 @@ def log_stage_report(
                 console="off",
                 x_disable_meta=True,
                 x_disable_stats=True,
+                finish_timeout=5,
+                finish_timeout_raises=True,
             ),
         )
         try:

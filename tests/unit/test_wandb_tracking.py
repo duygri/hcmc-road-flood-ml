@@ -151,6 +151,26 @@ def test_empty_metrics_do_not_fabricate_measurements(service):
     run.finish.assert_called_once_with()
 
 
+def test_finish_timeout_returns_failed_instead_of_waiting_for_uploads(service):
+    sdk, run = service
+
+    def finish():
+        settings = sdk.init.call_args.kwargs["settings"]
+        assert settings.get("finish_timeout") == 5
+        if settings.get("finish_timeout_raises"):
+            raise TimeoutError("synthetic upload timeout")
+
+    run.finish.side_effect = finish
+    assert (
+        logger()(run_id="synthetic", stage="track-b", config={}, summary={}, metrics={})
+        == "failed"
+    )
+    settings = sdk.init.call_args.kwargs["settings"]
+    assert settings.get("finish_timeout") == 5
+    assert settings.get("finish_timeout_raises") is True
+    run.finish.assert_called_once_with()
+
+
 @pytest.mark.parametrize("failure", ["init", "log", "summary", "finish"])
 def test_remote_failures_return_failed_and_finalize(service, failure):
     sdk, run = service

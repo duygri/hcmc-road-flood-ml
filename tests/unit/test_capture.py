@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import geopandas as gpd
@@ -13,6 +14,17 @@ from shapely.geometry import LineString
 from flood_ml.config import PipelineError
 from flood_ml.evaluation.capture import evaluate_capture, evaluation_gate
 from flood_ml.labeling.reviews import LINK_COLUMNS
+
+
+@pytest.fixture(autouse=True)
+def disable_remote_tracking(monkeypatch):
+    """CLI tests must never inherit credentials; SDK tests opt in synthetically."""
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+
+def test_evaluation_tests_do_not_inherit_tracking_credentials():
+    key_present = bool(os.environ.get("WANDB_API_KEY"))
+    assert not key_present
 
 
 @pytest.fixture
@@ -543,7 +555,7 @@ def test_capture_rejects_two_models_claiming_the_same_ratio_seed(capture_case):
         evaluate_capture(**capture_case, track_b_scores=scores)
 
 
-def test_cli_loads_and_hashes_optional_track_b_input(tmp_path, capture_case):
+def test_cli_loads_and_hashes_optional_track_b_input(tmp_path, capture_case, capsys):
     import shutil
 
     root = Path(__file__).resolve().parents[2]
@@ -560,6 +572,9 @@ def test_cli_loads_and_hashes_optional_track_b_input(tmp_path, capture_case):
     arguments.extend(["--track-b-scores", "track_b.parquet"])
     cli = load_cli()
     assert cli.main(arguments) == 0
+    assert (
+        json.loads(capsys.readouterr().out)["tracking_status"] == "skipped_no_api_key"
+    )
     result = json.loads((tmp_path / "evaluation.json").read_text())
     assert result["status"] == "complete"
     assert result["input_paths"]["track_b_scores"] == "track_b.parquet"
@@ -578,6 +593,89 @@ def load_cli():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_track_b_tracking_keeps_evaluation_git_provenance_clean(
+    tmp_path, capture_case, monkeypatch
+):
+    """SDK run files must not dirty the checkout before evaluation snapshots Git."""
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from types import SimpleNamespace
+
+    from flood_ml.utils.wandb_tracking import log_stage_report
+
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    (repo / ".gitignore").write_text("reports/\n")
+    root = Path(__file__).resolve().parents[2]
+    shutil.copytree(root / "configs", repo / "configs")
+    for name in ("scores", "roads", "confirmed_event_segments", "partitions"):
+        frame = capture_case[name].copy()
+        if name == "confirmed_event_segments":
+            frame["affected_geometry"] = frame.affected_geometry.map(lambda g: g.wkb)
+        frame.to_parquet(repo / f"{name}.parquet")
+    for args in (
+        ["init"],
+        ["add", "."],
+        [
+            "-c",
+            "user.name=Synthetic Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "synthetic fixture",
+        ],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    monkeypatch.chdir(repo)
+    output = repo / "reports" / "evaluation.json"
+    arguments = ["--repo-root", str(repo), "--output", "reports/evaluation.json"]
+    for name in ("scores", "roads", "confirmed-event-segments", "partitions"):
+        arguments.extend([f"--{name}", f"{name.replace('-', '_')}.parquet"])
+    cli = load_cli()
+    assert cli.main(arguments) == 0
+    before = json.loads(output.read_text())["git"]
+    assert before["commit"] is not None
+    assert before["dirty"] is False
+
+    roots = []
+
+    def initialize(**options):
+        run_root = Path(options.get("dir", Path.cwd())).resolve()
+        roots.append(run_root)
+        # Model the SDK's local output without authentication or a live service.
+        run_dir = run_root / "wandb" / options["job_type"]
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "debug.log").write_text("synthetic SDK output")
+        return SimpleNamespace(
+            summary={}, log=lambda metrics: None, finish=lambda: None
+        )
+
+    monkeypatch.setenv("WANDB_API_KEY", "synthetic-test-key")
+    monkeypatch.setitem(
+        sys.modules, "wandb", SimpleNamespace(init=initialize, Settings=lambda **kw: kw)
+    )
+    assert (
+        log_stage_report(
+            run_id="synthetic", stage="track-b", config={}, summary={}, metrics={}
+        )
+        == "logged"
+    )
+    monkeypatch.chdir(repo / "configs")
+    assert cli.main(arguments) == 0
+    assert json.loads(output.read_text())["git"] == before
+    assert len(roots) == 2
+    assert roots[0] == roots[1]
+    assert roots[0] == Path(tempfile.gettempdir()) / "hcmc-road-flood-ml-wandb"
+    assert roots[0].is_absolute()
+    assert not roots[0].is_relative_to(repo)
+    assert roots[0].is_dir()
 
 
 @pytest.mark.parametrize("pending", [False, True])

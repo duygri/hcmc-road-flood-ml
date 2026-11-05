@@ -25,6 +25,7 @@ from flood_ml.training.presence_background import fit_track_b, score_track_b
 from flood_ml.training.sampling import FEATURE_COLUMNS, build_background_draws
 from flood_ml.utils.publication import preflight
 from flood_ml.utils.run import _hash_file, _hash_json, start_run, write_json_atomic
+from flood_ml.utils.wandb_tracking import log_stage_report
 
 
 def _draw_settings(rules):
@@ -290,7 +291,73 @@ def main(argv: list[str] | None = None) -> int:
             raise PipelineError("Derived source inputs changed during Track B run")
         payload["source_inputs_unchanged"] = True
         _publish(staged, publications["report"], payload)
-        print(json.dumps({"status": payload["status"], "run_id": run_id}))
+        # Select metadata explicitly: report gates/draws contain private IDs,
+        # review details, paths, and artifact references that must stay local.
+        logistic_parameters = {
+            key: rules["logistic_regression"][key] for key in ("C", "max_iter")
+        }
+        tracking_status = log_stage_report(
+            run_id=run_id,
+            stage="track-b",
+            config={
+                "track_b": {
+                    **{
+                        key: rules[key]
+                        for key in (
+                            "feature_columns",
+                            "primary_background_ratio",
+                            "sensitivity_background_ratios",
+                            "seed_start",
+                            "seed_repetitions",
+                            "minimum_reference_events",
+                        )
+                    },
+                    "logistic_regression": logistic_parameters,
+                },
+                "run_id": run_id,
+                "source_commit": payload["git"]["commit"],
+                **{
+                    key: payload[key]
+                    for key in (
+                        "config_hash",
+                        "lock_sha256",
+                        "code_sha256",
+                        "model_versions",
+                    )
+                },
+            },
+            summary={
+                "status": payload["status"],
+                **{
+                    key: payload["gate"][key]
+                    for key in (
+                        "reviewed_reference_events",
+                        "reviewed_holdout_events",
+                        "feature_eligible_reference_events",
+                    )
+                },
+            },
+            metrics={
+                "feature_input": payload["counts"]["feature_input"],
+                "draws": len(payload["draws"]),
+                "failed_draws": len(payload["failures"]),
+                "logistic_regression": logistic_parameters,
+                **{
+                    key: payload["counts"][key]
+                    for key in ("fitted_models", "scored_rows", "scored_holdout_roads")
+                    if key in payload["counts"]
+                },
+            },
+        )
+        print(
+            json.dumps(
+                {
+                    "status": payload["status"],
+                    "run_id": run_id,
+                    "tracking_status": tracking_status,
+                }
+            )
+        )
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         if run is not None:

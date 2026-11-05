@@ -27,6 +27,21 @@ The notebook imports `Path` before this parameter block. The selected commit
 must be available in the public repository; both Colab and the final local
 replay must use that exact SHA and the same raw/review snapshot.
 
+For optional W&B experiment tracking, open Colab's **Secrets** panel (key icon),
+add a secret named `WANDB_API_KEY`, paste your API key as its value, and enable
+**Notebook access** for this notebook. Never paste the key into a code cell,
+notebook output, configuration file, report, or Drive. The setup reads only this
+Secret and passes it in the in-memory `ENV` for `uv run` child processes; it does
+not authenticate from the notebook kernel or save the credential. Child command
+logs redact the key before display or persistence.
+
+Tracking defaults to `WANDB_ENTITY=duygri-saigon-university-sgu-` and
+`WANDB_PROJECT=hcmc-road-flood-ml`; existing environment values can override these
+two defaults. If the Secret is missing, empty, or notebook access is disabled,
+the notebook explicitly reports that W&B tracking is skipped and continues the
+existing local/Drive pipeline. Local replay uses its own environment and does
+not copy the Colab Secret.
+
 Prepare this layout in Drive:
 
 ```text

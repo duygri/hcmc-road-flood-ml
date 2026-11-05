@@ -580,6 +580,206 @@ def load_cli():
     return module
 
 
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("remote_failure", [False, True])
+def test_cli_tracks_only_safe_evaluation_metadata_after_publication(
+    tmp_path, capture_case, monkeypatch, capsys, pending, remote_failure
+):
+    """Catch missing logging, private payload leakage, and writes after logging."""
+    import shutil
+    import sys
+    from types import SimpleNamespace
+
+    root = Path(__file__).resolve().parents[2]
+    shutil.copytree(root / "configs", tmp_path / "configs")
+    if pending:
+        capture_case["confirmed_event_segments"] = pd.DataFrame(columns=LINK_COLUMNS)
+    for name in ("scores", "roads", "confirmed_event_segments", "partitions"):
+        frame = capture_case[name].copy()
+        if name == "confirmed_event_segments":
+            frame["affected_geometry"] = frame.affected_geometry.map(lambda g: g.wkb)
+        frame.to_parquet(tmp_path / f"{name}.parquet")
+    track_b_frame(capture_case).to_parquet(tmp_path / "track_b.parquet")
+    arguments = [
+        "--repo-root",
+        str(tmp_path),
+        "--output",
+        "evaluation.json",
+        "--run-id",
+        "synthetic_evaluation",
+    ]
+    for name in ("scores", "roads", "confirmed-event-segments", "partitions"):
+        arguments.extend([f"--{name}", f"{name.replace('-', '_')}.parquet"])
+    arguments.extend(["--track-b-scores", "track_b.parquet"])
+    output = tmp_path / "evaluation.json"
+    observed = {"logs": [], "finishes": 0}
+
+    def log(metrics):
+        observed["logs"].append(metrics)
+        if remote_failure:
+            raise RuntimeError("synthetic remote failure")
+
+    def finish():
+        observed["finishes"] += 1
+
+    summary = {}
+
+    def initialize(**options):
+        # The SDK boundary must only be reached after the complete local report.
+        observed["before"] = output.read_bytes()
+        observed["options"] = options
+        if remote_failure and pending:
+            raise RuntimeError("synthetic initialization failure")
+        return SimpleNamespace(summary=summary, log=log, finish=finish)
+
+    monkeypatch.setenv("WANDB_API_KEY", "synthetic-test-key")
+    monkeypatch.setitem(
+        sys.modules, "wandb", SimpleNamespace(init=initialize, Settings=lambda **kw: kw)
+    )
+    assert load_cli().main(arguments) == 0
+    printed = json.loads(capsys.readouterr().out)
+    expected_tracking = "failed" if remote_failure else "logged"
+    assert printed["tracking_status"] == expected_tracking
+    assert output.read_bytes() == observed["before"]
+    report = json.loads(output.read_text())
+    assert "tracking_status" not in report
+    options = observed["options"]
+    assert options["name"] == "synthetic_evaluation-evaluation"
+    assert options["group"] == "synthetic_evaluation"
+    assert options["job_type"] == "evaluation"
+    assert set(options["config"]) == {
+        "run_id",
+        "evaluation",
+        "config_hash",
+        "source_commit",
+        "source_dirty",
+    }
+    assert options["config"]["evaluation"]["minimum_holdout_events"] == 20
+    assert options["config"]["evaluation"]["bootstrap_repetitions"] == 1000
+    assert options["config"]["config_hash"] == report["config_hash"]
+    assert options["config"]["source_commit"] == report["git"]["commit"]
+    assert options["config"]["source_dirty"] == report["git"]["dirty"]
+    expected_summary = {
+        "status": "pending_label_review" if pending else "complete",
+        "evaluation_performed": not pending,
+        "reference_events": 0 if pending else 20,
+        "holdout_events": 0 if pending else 20,
+        "missing_reference_events": 20 if pending else 0,
+        "missing_holdout_events": 20 if pending else 0,
+        "missing_holdout_blocks": 3 if pending else 0,
+        "qualifying_holdout_blocks": 0 if pending else 3,
+    }
+    assert summary == ({} if remote_failure and pending else expected_summary)
+    if pending:
+        assert observed["logs"] == []
+    else:
+        assert len(observed["logs"]) == 1
+        metrics = observed["logs"][0]
+        prefix = "methods/track_b/track_b_r10_s42/top_k/0.01"
+        assert metrics[f"{prefix}/capture_any"] == 0.25
+        assert metrics[f"{prefix}/capture_difference_vs_mcda"] == 0
+        assert metrics[f"{prefix}/uncertainty/replicates"] == 1000
+        assert f"{prefix}/uncertainty/capture_ci95/lower" in metrics
+        assert f"{prefix}/uncertainty/capture_ci95/upper" in metrics
+        allowed = {
+            "capture",
+            "capture_any",
+            "capture_all",
+            "lift",
+            "lift_vs_mcda",
+            "lift_vs_elevation_only",
+            "capture_difference_vs_mcda",
+            "capture_difference_vs_elevation_only",
+        }
+        uncertainty = {
+            "replicates",
+            "valid_replicates",
+            "undefined_replicates",
+            "undefined_lift_replicates",
+            "capture_ci95/lower",
+            "capture_ci95/upper",
+            "capture_any_ci95/lower",
+            "capture_any_ci95/upper",
+            "capture_all_ci95/lower",
+            "capture_all_ci95/upper",
+            "lift_ci95/lower",
+            "lift_ci95/upper",
+        }
+        assert {key.split("/top_k/")[1].split("/", 1)[1] for key in metrics} <= (
+            allowed | {f"uncertainty/{key}" for key in uncertainty}
+        )
+        assert all(
+            np.isfinite(value) and not isinstance(value, bool)
+            for value in metrics.values()
+        )
+    assert observed["finishes"] == (0 if remote_failure and pending else 1)
+    payload = json.dumps(
+        {"config": options["config"], "summary": summary, "metrics": observed["logs"]}
+    )
+    for private in (
+        "eligible_event_ids",
+        "event_affected",
+        "selected_road_segment_ids",
+        "input_paths",
+        "input_hashes",
+        "affected_geometry",
+        "reviewed_by",
+        "reviewed road extent",
+        "h0-0",
+        "scores.parquet",
+        str(tmp_path),
+    ):
+        assert private not in payload
+
+
+def test_tracking_metrics_omit_nonfinite_null_boolean_and_private_numeric_leaves():
+    report = {
+        "evaluation_performed": True,
+        "methods": {
+            "mcda": {
+                "eligible_road_length_m": 123,
+                "top_k": {
+                    "0.1": {
+                        "capture": 0.5,
+                        "capture_any": float("inf"),
+                        "capture_all": True,
+                        "lift": None,
+                        "lift_vs_elevation_only": float("nan"),
+                        "actual_selected_fraction": 0.11,
+                        "event_affected_fraction": {"private-event": 0.8},
+                        "uncertainty": {
+                            "replicates": 1000,
+                            "valid_replicates": 999,
+                            "undefined_replicates": 1,
+                            "undefined_lift_replicates": 3,
+                            "capture_ci95": [0.2, 0.8],
+                            "capture_any_ci95": None,
+                            "capture_all_ci95": [float("-inf"), 0.9],
+                            "lift_ci95": [float("nan"), None],
+                            "private_numeric": 456,
+                        },
+                    }
+                },
+            },
+            "private_method": {"top_k": {"0.1": {"capture": 0.9}}},
+        },
+    }
+    cli = load_cli()
+    prefix = "methods/mcda/top_k/0.1"
+    assert cli._tracking_metrics(report) == {
+        f"{prefix}/capture": 0.5,
+        f"{prefix}/uncertainty/replicates": 1000,
+        f"{prefix}/uncertainty/valid_replicates": 999,
+        f"{prefix}/uncertainty/undefined_replicates": 1,
+        f"{prefix}/uncertainty/undefined_lift_replicates": 3,
+        f"{prefix}/uncertainty/capture_ci95/lower": 0.2,
+        f"{prefix}/uncertainty/capture_ci95/upper": 0.8,
+        f"{prefix}/uncertainty/capture_all_ci95/upper": 0.9,
+    }
+    report["evaluation_performed"] = False
+    assert cli._tracking_metrics(report) == {}
+
+
 def test_cli_atomically_writes_real_empty_review_pending(tmp_path, capture_case):
     root = Path(__file__).resolve().parents[2]
     scores = tmp_path / "scores.parquet"

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -17,7 +18,7 @@ from flood_ml.config import (
     load_settings,
     resolve_output,
 )
-from flood_ml.evaluation.capture import evaluate_capture
+from flood_ml.evaluation.capture import RULES, evaluate_capture
 from flood_ml.utils.run import (
     _git_state,
     _hash_file,
@@ -25,6 +26,66 @@ from flood_ml.utils.run import (
     _snapshot,
     write_json_atomic,
 )
+from flood_ml.utils.wandb_tracking import log_stage_report
+
+
+def _tracking_metrics(report: dict) -> dict:
+    """Select aggregate capture/lift/bootstrap values; keep row-level data local."""
+    metrics = {}
+    if not report["evaluation_performed"]:
+        return metrics
+
+    def add(name, value):
+        if (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+        ):
+            metrics[name] = value
+
+    methods = report.get("methods", {})
+    ranked = [
+        (name, methods[name])
+        for name in ("mcda", "elevation_only", "random")
+        if name in methods
+    ]
+    ranked.extend(
+        (f"track_b/{name}", method)
+        for name, method in methods.get("track_b", {}).items()
+    )
+    for method_name, method in ranked:
+        for fraction, values in method["top_k"].items():
+            prefix = f"methods/{method_name}/top_k/{fraction}"
+            for key in (
+                "capture",
+                "capture_any",
+                "capture_all",
+                "lift",
+                "lift_vs_mcda",
+                "lift_vs_elevation_only",
+                "capture_difference_vs_mcda",
+                "capture_difference_vs_elevation_only",
+            ):
+                add(f"{prefix}/{key}", values.get(key))
+            uncertainty = values.get("uncertainty", {})
+            for key in (
+                "replicates",
+                "valid_replicates",
+                "undefined_replicates",
+                "undefined_lift_replicates",
+            ):
+                add(f"{prefix}/uncertainty/{key}", uncertainty.get(key))
+            for key in (
+                "capture_ci95",
+                "capture_any_ci95",
+                "capture_all_ci95",
+                "lift_ci95",
+            ):
+                interval = uncertainty.get(key)
+                if isinstance(interval, (list, tuple)) and len(interval) == 2:
+                    for endpoint, value in zip(("lower", "upper"), interval):
+                        add(f"{prefix}/uncertainty/{key}/{endpoint}", value)
+    return metrics
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -139,11 +200,39 @@ def main(argv: list[str] | None = None) -> int:
             else None,
         )
         write_json_atomic(output, report)
+        tracking_status = log_stage_report(
+            run_id=run_id,
+            stage="evaluation",
+            config={
+                "run_id": run_id,
+                "evaluation": dict(RULES),
+                "config_hash": report["config_hash"],
+                "source_commit": report["git"]["commit"],
+                "source_dirty": report["git"]["dirty"],
+            },
+            summary={
+                "status": report["status"],
+                "evaluation_performed": report["evaluation_performed"],
+                **{
+                    key: report["gate"][key]
+                    for key in (
+                        "reference_events",
+                        "holdout_events",
+                        "missing_reference_events",
+                        "missing_holdout_events",
+                        "missing_holdout_blocks",
+                        "qualifying_holdout_blocks",
+                    )
+                },
+            },
+            metrics=_tracking_metrics(report),
+        )
         print(
             json.dumps(
                 {
                     "status": report["status"],
                     "evaluation_performed": report["evaluation_performed"],
+                    "tracking_status": tracking_status,
                     "output": str(output),
                     "gate": report["gate"],
                 },

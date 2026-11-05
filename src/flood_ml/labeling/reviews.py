@@ -89,8 +89,10 @@ def _table(frame, columns, keys):
         def explicit_boolean(value):
             if isinstance(value, (bool, np.bool_)):
                 return bool(value)
-            if isinstance(value, str) and value in ("true", "false", ""):
-                return value == "true"
+            if isinstance(value, str):
+                normalized = value.strip().casefold()
+                if normalized in ("true", "false", ""):
+                    return normalized == "true"
             raise PipelineError(
                 "affected_geometry_complete must be explicit true/false or blank"
             )

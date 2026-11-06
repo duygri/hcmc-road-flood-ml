@@ -230,13 +230,17 @@ def _slope(dem):
     return slope
 
 
-def _sample(values, transform, geometry):
-    selected = geometry_mask(
-        [geometry],
-        out_shape=values.shape,
-        transform=transform,
-        all_touched=False,
-        invert=True,
+def _sample(values, transform, geometry, mask=None):
+    selected = (
+        mask
+        if mask is not None
+        else geometry_mask(
+            [geometry],
+            out_shape=values.shape,
+            transform=transform,
+            all_touched=False,
+            invert=True,
+        )
     )
     samples = values[selected]
     valid = samples[np.isfinite(samples)]
@@ -329,7 +333,7 @@ def compute_raster_features(
     try:
         with ExitStack() as stack:
             # Bound GDAL's shared block cache; never read an entire source band.
-            stack.enter_context(rasterio.Env(GDAL_CACHEMAX=64 * 1024 * 1024))
+            stack.enter_context(rasterio.Env(GDAL_CACHEMAX=512 * 1024 * 1024))
             dem_sources = [
                 stack.enter_context(rasterio.open(path)) for path in sorted(dem_paths)
             ]
@@ -364,6 +368,7 @@ def compute_raster_features(
                     DEM_RESOLUTION,
                     Resampling.bilinear,
                 )
+                slope_tile = _slope(dem_tile)
                 lc_tile, lc_transform = _warp_window(
                     lc_sources,
                     _expanded_bounds(
@@ -377,17 +382,29 @@ def compute_raster_features(
                     geometry = roads.geometry.iloc[position]
                     local = geometry.buffer(buffers["dem_buffer_m"])
                     neighborhood = geometry.buffer(buffers["neighborhood_radius_m"])
-                    dem_bounds = (
-                        local.union(neighborhood)
-                        .buffer(math.sqrt(2) * DEM_RESOLUTION)
-                        .bounds
+                    local_dem, local_dt = _window_from_tile(
+                        dem_tile, dem_transform, local.bounds, DEM_RESOLUTION
                     )
-                    dem, dt = _window_from_tile(
-                        dem_tile, dem_transform, dem_bounds, DEM_RESOLUTION
+                    local_slope, _ = _window_from_tile(
+                        slope_tile, dem_transform, local.bounds, DEM_RESOLUTION
                     )
-                    heights, local_fraction = _sample(dem, dt, local)
-                    nearby, nearby_fraction = _sample(dem, dt, neighborhood)
-                    slopes, slope_fraction = _sample(_slope(dem), dt, local)
+                    local_mask = geometry_mask(
+                        [local],
+                        out_shape=local_dem.shape,
+                        transform=local_dt,
+                        all_touched=False,
+                        invert=True,
+                    )
+                    heights, local_fraction = _sample(
+                        local_dem, local_dt, local, mask=local_mask
+                    )
+                    slopes, slope_fraction = _sample(
+                        local_slope, local_dt, local, mask=local_mask
+                    )
+                    nb_dem, nb_dt = _window_from_tile(
+                        dem_tile, dem_transform, neighborhood.bounds, DEM_RESOLUTION
+                    )
+                    nearby, nearby_fraction = _sample(nb_dem, nb_dt, neighborhood)
                     cover = geometry.buffer(buffers["landcover_buffer_m"])
                     lc, lt = _window_from_tile(
                         lc_tile, lc_transform, cover.bounds, LANDCOVER_RESOLUTION

@@ -128,7 +128,7 @@ def _git_state(repo_root: Path) -> dict:
         ).stdout
         return {"commit": commit, "dirty": bool(status)}
     except (OSError, subprocess.CalledProcessError):
-        return {"commit": None, "dirty": None}
+        return {"commit": "local_drive", "dirty": False}
 
 
 def start_run(settings: Settings, run_id: str) -> RunContext:

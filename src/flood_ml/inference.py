@@ -1,4 +1,4 @@
-"""Bộ nạp mô hình (Model + Preprocessing + Config) để dự đoán nguy cơ ngập lụt đường bộ TP.HCM."""
+"""Bộ nạp mô hình (Model + Preprocessing + Config) dự đoán nguy cơ ngập đường bộ."""
 
 from __future__ import annotations
 
@@ -8,14 +8,21 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:  # pragma: no cover - optional in CPU-only CI environments
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
 
 
-class FloodSusceptibilityNet(nn.Module):
+class FloodSusceptibilityNet(nn.Module if nn is not None else object):  # type: ignore[misc]
     """Kiến trúc Residual Tabular MLP đã chuẩn hóa chống Overfitting."""
 
     def __init__(self, in_features: int, hidden_dim: int = 64):
+        if nn is None:
+            raise ImportError("PyTorch is required to instantiate FloodSusceptibilityNet")
         super().__init__()
         self.input_layer = nn.Sequential(
             nn.Linear(in_features, hidden_dim),
@@ -39,16 +46,20 @@ class FloodSusceptibilityNet(nn.Module):
             nn.Linear(32, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any) -> Any:
         h = self.input_layer(x)
         h = h + 0.5 * self.res_block(h)
         return self.head(h).squeeze(-1)
 
 
 class FloodSusceptibilityPredictor:
-    """Nạp trọn bộ Model + Preprocessing Scaler + Cấu hình ngưỡng nguy cơ từ thư mục đóng gói."""
+    """Nạp trọn bộ Model + Preprocessing Scaler + Cấu hình ngưỡng nguy cơ."""
 
     def __init__(self, bundle_dir: str | Path, device: str | None = None):
+        if torch is None:
+            raise ImportError(
+                "PyTorch is required to run FloodSusceptibilityPredictor"
+            )
         self.bundle_dir = Path(bundle_dir)
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,7 +90,10 @@ class FloodSusceptibilityPredictor:
             self.model_config = json.loads(cfg_path.read_text(encoding="utf-8"))
         else:
             self.model_config = {
-                "architecture": {"in_features": len(self.prep_config["feature_columns"]), "hidden_dim": 64},
+                "architecture": {
+                    "in_features": len(self.prep_config["feature_columns"]),
+                    "hidden_dim": 64,
+                },
                 "thresholds": {"default": 0.5, "top_10_pct": 0.45, "top_5_pct": 0.52},
             }
 
@@ -101,7 +115,7 @@ class FloodSusceptibilityPredictor:
         self.model.eval()
 
     def preprocess(self, df: pd.DataFrame) -> np.ndarray:
-        """Chuẩn hóa bảng đặc trưng đầu vào theo đúng thứ tự cột, điền khuyết (nếu có) và StandardScaler."""
+        """Chuẩn hóa bảng đặc trưng đầu vào theo đúng thứ tự cột và StandardScaler."""
         work = pd.DataFrame(index=df.index)
         for col in self.feature_columns:
             if col in df.columns:
@@ -114,7 +128,7 @@ class FloodSusceptibilityPredictor:
         return (x_raw - self.mean) / np.where(self.scale == 0, 1.0, self.scale)
 
     def predict_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Trả về bảng kết quả kèm xác suất nhạy cảm ngập và phân tầng mức độ nguy cơ."""
+        """Trả về bảng kết quả kèm xác suất nhạy cảm ngập và phân tầng nguy cơ."""
         x_scaled = self.preprocess(df)
         with torch.no_grad():
             x_tensor = torch.from_numpy(x_scaled).to(self.device)
@@ -147,4 +161,3 @@ class FloodSusceptibilityPredictor:
             "flood_susceptibility_prob": float(res["flood_susceptibility_prob"]),
             "risk_tier": str(res["risk_tier"]),
         }
-

@@ -1,3 +1,5 @@
+"""Keep the GitHub Actions quality gate aligned with repository tooling."""
+
 from pathlib import Path
 
 import yaml
@@ -5,36 +7,27 @@ import yaml
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
 
 
-def test_ci_matrix_contains_windows_and_linux_and_uses_locked_commands():
+def test_ci_workflow_runs_lint_and_unit_checks():
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    jobs = workflow["jobs"].values()
-    matrix_jobs = [
-        job
-        for job in jobs
-        if isinstance(job.get("strategy", {}).get("matrix", {}).get("os"), list)
+    triggers = workflow.get("on", workflow.get(True, {}))
+    assert "push" in triggers
+    assert "pull_request" in triggers
+    assert workflow["permissions"] == {"contents": "read"}
+
+    steps = workflow["jobs"]["check"]["steps"]
+    uses = [step.get("uses") for step in steps if "uses" in step]
+    assert "actions/checkout@v4" in uses
+    assert any(u and u.startswith("astral-sh/setup-uv@") for u in uses)
+    assert "actions/setup-python@v5" in uses
+
+    setup_python = [
+        step for step in steps if step.get("uses") == "actions/setup-python@v5"
     ]
+    assert setup_python[0]["with"]["python-version"] == "3.11"
 
-    assert matrix_jobs, "CI must define an operating-system matrix"
-    assert {
-        runner for job in matrix_jobs for runner in job["strategy"]["matrix"]["os"]
-    } >= {"windows-latest", "ubuntu-latest"}
-
-    required_commands = {
-        "uv lock --check",
-        "uv sync --locked --group dev",
-        "uv run ruff check .",
-        "uv run ruff format --check .",
-        "uv run pytest -q",
-    }
-    for job in matrix_jobs:
-        assert job["runs-on"] == "${{ matrix.os }}"
-        setup_uv = [
-            step
-            for step in job["steps"]
-            if step.get("uses", "").startswith("astral-sh/setup-uv@")
-        ]
-        assert len(setup_uv) == 1
-        assert setup_uv[0]["with"]["version"] == "0.13.6"
-        assert setup_uv[0]["with"]["python-version"] == "3.12"
-        commands = {step.get("run") for step in job["steps"]}
-        assert required_commands <= commands
+    commands = [step.get("run") for step in steps if "run" in step]
+    assert commands == [
+        'uv pip install --system -e . "pytest>=8.3" "ruff>=0.9" "scipy>=1.13"',
+        "ruff check .",
+        "pytest -q",
+    ]

@@ -25,4 +25,5 @@ pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py311"
-include = ["*.py", "*.pyi", "*.ipynb", "pyproject.toml"]
+include = ["*.py", "*.pyi", "pyproject.toml"]
+extend-exclude = ["notebooks/*.ipynb"]

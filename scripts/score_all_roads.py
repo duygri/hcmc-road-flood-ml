@@ -1,23 +1,14 @@
-"""Tính điểm nguy cơ ngập lụt cho toàn bộ 100% đoạn đường trong phạm vi nghiên cứu TP.HCM (AOI)."""
+"""Tính điểm nguy cơ ngập lụt cho toàn bộ 100% đoạn đường trong AOI TP.HCM."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import geopandas as gpd
-import matplotlib
 import numpy as np
 import pandas as pd
-import torch
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from flood_ml.inference import FloodSusceptibilityPredictor
 
 
@@ -38,27 +29,30 @@ def score_entire_study_area(
     scored = predictor.predict_dataframe(df_feat)
 
     # Ghép phân vùng không gian và điểm MCDA vật lý
-    full_df = (
-        scored.merge(
-            df_part[["road_segment_id", "partition", "block_id"]],
-            on="road_segment_id",
-            how="left",
-        )
-        .merge(
-            df_mcda[["road_segment_id", "score", "mcda_eligible", "score_reason"]],
-            on="road_segment_id",
-            how="left",
-        )
+    full_df = scored.merge(
+        df_part[["road_segment_id", "partition", "block_id"]],
+        on="road_segment_id",
+        how="left",
+    ).merge(
+        df_mcda[["road_segment_id", "score", "mcda_eligible", "score_reason"]],
+        on="road_segment_id",
+        how="left",
     )
 
-    # Ghép tên đường (road_name), cấp đường (highway_type) và chiều dài từ road_segments.gpkg
+    # Ghép tên đường, cấp đường và chiều dài từ road_segments.gpkg
     roads_gpkg = interim_dir / "road_segments.gpkg"
     roads_gdf = None
     if roads_gpkg.is_file():
         roads_gdf = gpd.read_file(roads_gpkg)
         meta_cols = [
             c
-            for c in ("road_segment_id", "osm_way_id", "road_name", "highway_type", "length_m")
+            for c in (
+                "road_segment_id",
+                "osm_way_id",
+                "road_name",
+                "highway_type",
+                "length_m",
+            )
             if c in roads_gdf.columns
         ]
         full_df = full_df.merge(
@@ -76,8 +70,12 @@ def score_entire_study_area(
         )
 
     # Quy đổi sang thang điểm 0 - 100
-    full_df["mlp_risk_score_100"] = (full_df["flood_susceptibility_prob"] * 100.0).round(2)
-    full_df["mcda_score_100"] = pd.to_numeric(full_df["score"], errors="coerce").round(2)
+    full_df["mlp_risk_score_100"] = (
+        full_df["flood_susceptibility_prob"] * 100.0
+    ).round(2)
+    full_df["mcda_score_100"] = pd.to_numeric(full_df["score"], errors="coerce").round(
+        2
+    )
     full_df["hybrid_risk_score_100"] = np.where(
         full_df["mcda_score_100"].notna(),
         0.5 * full_df["mlp_risk_score_100"] + 0.5 * full_df["mcda_score_100"],
@@ -85,7 +83,9 @@ def score_entire_study_area(
     ).round(2)
 
     # Với các đoạn cầu/hầm (score_eligible == False), đánh dấu rõ cấu trúc loại trừ
-    eligible_mask = full_df.get("score_eligible", pd.Series(True, index=full_df.index)).fillna(True)
+    eligible_mask = full_df.get(
+        "score_eligible", pd.Series(True, index=full_df.index)
+    ).fillna(True)
     full_df["risk_percentile"] = np.nan
     full_df.loc[eligible_mask, "risk_percentile"] = (
         full_df.loc[eligible_mask, "mlp_risk_score_100"].rank(pct=True) * 100.0
@@ -119,13 +119,17 @@ def score_entire_study_area(
         ascending=[False, False, False],
         kind="stable",
     ).reset_index(drop=True)
-    full_df["risk_rank"] = np.where(eligible_mask, np.arange(1, len(full_df) + 1), np.nan)
+    full_df["risk_rank"] = np.where(
+        eligible_mask, np.arange(1, len(full_df) + 1), np.nan
+    )
 
     # Lưu bảng Parquet đầy đủ và CSV Top 1.000 đoạn đường nguy cơ cao nhất
     parquet_out = output_dir / "full_study_area_road_risk_scores.parquet"
     csv_top1000 = output_dir / "top_1000_highest_risk_roads.csv"
     full_df.to_parquet(parquet_out, index=False)
-    full_df.loc[eligible_mask].head(1000).to_csv(csv_top1000, index=False, encoding="utf-8-sig")
+    full_df.loc[eligible_mask].head(1000).to_csv(
+        csv_top1000, index=False, encoding="utf-8-sig"
+    )
 
     # Xuất GeoJSON chuẩn Web GIS (WGS84 - EPSG:4326) ghép điểm nguy cơ với tọa độ đường
     if roads_gdf is not None:
@@ -155,7 +159,7 @@ def score_entire_study_area(
         geo_wgs84["lon"] = midpoints.x.round(6)
         geo_wgs84["lat"] = midpoints.y.round(6)
 
-        # 1. GeoJSON Top 10% đoạn đường nguy cơ cao nhất (tối ưu cho Web Map / Leaflet / Mapbox)
+        # 1. GeoJSON Top 10% đoạn đường nguy cơ cao nhất (tối ưu cho Web Map)
         top10_gdf = geo_wgs84[
             geo_wgs84["score_eligible"].fillna(True)
             & (geo_wgs84["risk_percentile"] >= 90.0)
@@ -166,12 +170,18 @@ def score_entire_study_area(
             coordinate_precision=6,
         )
 
-        # 2. GeoJSON toàn bộ mạng lưới trục đường chính (trunk, primary, secondary, tertiary)
-        major_gdf = geo_wgs84[
-            geo_wgs84["highway_type"].isin(
-                ["trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link", "tertiary", "tertiary_link"]
-            )
+        # 2. GeoJSON toàn bộ mạng lưới trục đường chính
+        major_types = [
+            "trunk",
+            "trunk_link",
+            "primary",
+            "primary_link",
+            "secondary",
+            "secondary_link",
+            "tertiary",
+            "tertiary_link",
         ]
+        major_gdf = geo_wgs84[geo_wgs84["highway_type"].isin(major_types)]
         major_gdf.to_file(
             output_dir / "hcmc_road_flood_risk_major_roads.geojson",
             driver="GeoJSON",
@@ -204,4 +214,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -17,6 +17,50 @@ except ImportError:  # pragma: no cover - optional in CPU-only CI environments
     nn = None  # type: ignore[assignment]
 
 
+def compute_local_basin_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Bổ sung đặc trưng địa hình cục bộ theo ô lưới 5km×5km (block_id) để nhận diện túi ngập ở vùng địa hình cao."""
+    out = df.copy()
+    elev = pd.to_numeric(
+        out.get("elevation_median_m", pd.Series(0.0, index=out.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    rel_elev = pd.to_numeric(
+        out.get("relative_elevation_m", pd.Series(0.0, index=out.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    builtup = pd.to_numeric(
+        out.get("builtup_ratio_250m", pd.Series(0.0, index=out.index)),
+        errors="coerce",
+    ).fillna(0.0)
+
+    if "block_id" in out.columns and out["block_id"].notna().any() and len(out) > 1:
+        grp = out.assign(
+            _elev=elev,
+            _rel_elev=rel_elev,
+        ).groupby("block_id", dropna=False)
+        block_med = grp["_elev"].transform("median")
+        block_iqr = (
+            grp["_elev"]
+            .transform(lambda s: s.quantile(0.75) - s.quantile(0.25))
+            .clip(lower=0.5)
+        )
+        out["block_rel_elev_z"] = ((elev - block_med) / block_iqr).astype(np.float32)
+        block_low_elev_pct = grp["_elev"].transform(lambda s: (-s).rank(pct=True))
+        block_dep_pct = grp["_rel_elev"].transform(lambda s: (-s).rank(pct=True))
+        builtup_pct = builtup.rank(pct=True)
+        out["local_pocket_index"] = (
+            0.45 * block_dep_pct + 0.35 * block_low_elev_pct + 0.20 * builtup_pct
+        ).astype(np.float32)
+    else:
+        out["block_rel_elev_z"] = np.float32(0.0)
+        out["local_pocket_index"] = np.clip(
+            0.5 * (1.0 / (1.0 + np.exp(rel_elev))) + 0.5 * builtup,
+            0.0,
+            1.0,
+        ).astype(np.float32)
+    return out
+
+
 class FloodSusceptibilityNet(nn.Module if nn is not None else object):  # type: ignore[misc]
     """Kiến trúc Residual Tabular MLP đã chuẩn hóa chống Overfitting."""
 
@@ -116,12 +160,17 @@ class FloodSusceptibilityPredictor:
 
     def preprocess(self, df: pd.DataFrame) -> np.ndarray:
         """Chuẩn hóa bảng đặc trưng đầu vào theo đúng thứ tự cột và StandardScaler."""
-        work = pd.DataFrame(index=df.index)
+        enriched = (
+            compute_local_basin_features(df)
+            if {"block_rel_elev_z", "local_pocket_index"} & set(self.feature_columns)
+            else df
+        )
+        work = pd.DataFrame(index=enriched.index)
         for col in self.feature_columns:
-            if col in df.columns:
-                series = pd.to_numeric(df[col], errors="coerce")
+            if col in enriched.columns:
+                series = pd.to_numeric(enriched[col], errors="coerce")
             else:
-                series = pd.Series(np.nan, index=df.index, dtype=np.float32)
+                series = pd.Series(np.nan, index=enriched.index, dtype=np.float32)
             fill_val = float(self.medians.get(col, 0.0))
             work[col] = series.fillna(fill_val).astype(np.float32)
         x_raw = work[self.feature_columns].to_numpy(dtype=np.float32)
@@ -129,7 +178,8 @@ class FloodSusceptibilityPredictor:
 
     def predict_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Trả về bảng kết quả kèm xác suất nhạy cảm ngập và phân tầng nguy cơ."""
-        x_scaled = self.preprocess(df)
+        enriched = compute_local_basin_features(df)
+        x_scaled = self.preprocess(enriched)
         with torch.no_grad():
             x_tensor = torch.from_numpy(x_scaled).to(self.device)
             probs = torch.sigmoid(self.model(x_tensor)).cpu().numpy()
@@ -148,7 +198,7 @@ class FloodSusceptibilityPredictor:
                 np.where(probs >= t_low, "Trung bình (Top 20%)", "Thấp"),
             ),
         )
-        out = df.copy()
+        out = enriched.copy()
         out["flood_susceptibility_prob"] = probs
         out["risk_tier"] = risk_levels
         return out

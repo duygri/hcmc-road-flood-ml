@@ -6,10 +6,24 @@ import argparse
 from pathlib import Path
 
 import geopandas as gpd
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
-from flood_ml.inference import FloodSusceptibilityPredictor
+from flood_ml.inference import FloodSusceptibilityPredictor, compute_local_basin_features
+
+FEATURE_COLS = [
+    "elevation_median_m",
+    "elevation_p10_m",
+    "relative_elevation_m",
+    "slope_mean_deg",
+    "builtup_ratio_250m",
+    "vegetation_ratio_250m",
+    "dist_water_m",
+    "water_area_ratio_250m",
+]
 
 
 def score_entire_study_area(
@@ -25,15 +39,19 @@ def score_entire_study_area(
     df_part = pd.read_parquet(processed_dir / "road_partitions.parquet")
     df_mcda = pd.read_parquet(processed_dir / "road_susceptibility.parquet")
 
-    # Dự đoán xác suất ngập từ mô hình Deep MLP cho toàn bộ 100% đoạn đường trong AOI
-    scored = predictor.predict_dataframe(df_feat)
-
-    # Ghép phân vùng không gian và điểm MCDA vật lý
-    full_df = scored.merge(
+    # Ghép phân vùng không gian trước khi tính đặc trưng cục bộ theo ô lưới (block_id)
+    merged_in = df_feat.merge(
         df_part[["road_segment_id", "partition", "block_id"]],
         on="road_segment_id",
         how="left",
-    ).merge(
+    )
+
+    # Dự đoán xác suất ngập từ mô hình Deep MLP cho toàn bộ 100% đoạn đường trong AOI
+    scored = predictor.predict_dataframe(merged_in)
+    scored = compute_local_basin_features(scored)
+
+    # Ghép điểm MCDA vật lý
+    full_df = scored.merge(
         df_mcda[["road_segment_id", "score", "mcda_eligible", "score_reason"]],
         on="road_segment_id",
         how="left",
@@ -69,17 +87,71 @@ def score_entire_study_area(
             else 150.0
         )
 
-    # Quy đổi sang thang điểm 0 - 100
+    # Tính xác suất Logistic Regression + Local Basin (L2 - 11 tham số) để kết hợp bộ ba Ensemble
+    confirmed_path = processed_dir / "confirmed_event_segments.parquet"
+    feat_cols = [c for c in FEATURE_COLS if c in full_df.columns]
+    local_feat_cols = [*feat_cols, "block_rel_elev_z", "local_pocket_index"]
+    if confirmed_path.is_file():
+        df_confirmed = pd.read_parquet(confirmed_path)
+        pos_ids = set(df_confirmed["road_segment_id"].dropna().unique())
+        full_df["_label"] = full_df["road_segment_id"].isin(pos_ids).astype(np.int32)
+        valid_lr = (
+            full_df[local_feat_cols].notna().all(axis=1)
+            & full_df.get("score_eligible", pd.Series(True, index=full_df.index)).fillna(True)
+        )
+        ref_pool = full_df.loc[valid_lr & (full_df["partition"] == "reference")]
+        if (ref_pool["_label"] == 1).sum() < 10:
+            ref_pool = full_df.loc[valid_lr]
+        pos_sub = ref_pool[ref_pool["_label"] == 1]
+        bg_sub = ref_pool[ref_pool["_label"] == 0]
+        if len(pos_sub) > 0 and len(bg_sub) > 0:
+            rng = np.random.default_rng(42)
+            n_bg = min(len(bg_sub), len(pos_sub) * 3)
+            tr_lr = pd.concat(
+                [pos_sub, bg_sub.iloc[rng.choice(len(bg_sub), size=n_bg, replace=False)]],
+                ignore_index=True,
+            ).sample(frac=1.0, random_state=42)
+            scaler_lr = StandardScaler()
+            x_tr_lr = scaler_lr.fit_transform(
+                tr_lr[local_feat_cols].to_numpy(dtype=np.float32)
+            )
+            clf_lr = LogisticRegression(
+                C=0.25, class_weight="balanced", max_iter=500, random_state=42
+            )
+            clf_lr.fit(x_tr_lr, tr_lr["_label"].to_numpy(dtype=np.int32))
+            work_lr = pd.DataFrame(index=full_df.index)
+            for col in local_feat_cols:
+                med_v = float(pd.to_numeric(ref_pool[col], errors="coerce").median())
+                work_lr[col] = (
+                    pd.to_numeric(full_df[col], errors="coerce")
+                    .fillna(med_v)
+                    .astype(np.float32)
+                )
+            full_df["logreg_local_prob"] = clf_lr.predict_proba(
+                scaler_lr.transform(work_lr[local_feat_cols].to_numpy(dtype=np.float32))
+            )[:, 1]
+        else:
+            full_df["logreg_local_prob"] = full_df["flood_susceptibility_prob"]
+        full_df = full_df.drop(columns=["_label"])
+    else:
+        full_df["logreg_local_prob"] = full_df["flood_susceptibility_prob"]
+
+    # Quy đổi sang thang điểm 0 - 100 (MLP, LogReg-Local, MCDA và Tri-Model Ensemble)
     full_df["mlp_risk_score_100"] = (
         full_df["flood_susceptibility_prob"] * 100.0
+    ).round(2)
+    full_df["logreg_risk_score_100"] = (
+        full_df["logreg_local_prob"] * 100.0
     ).round(2)
     full_df["mcda_score_100"] = pd.to_numeric(full_df["score"], errors="coerce").round(
         2
     )
     full_df["hybrid_risk_score_100"] = np.where(
         full_df["mcda_score_100"].notna(),
-        0.5 * full_df["mlp_risk_score_100"] + 0.5 * full_df["mcda_score_100"],
-        full_df["mlp_risk_score_100"],
+        0.45 * full_df["mlp_risk_score_100"]
+        + 0.45 * full_df["logreg_risk_score_100"]
+        + 0.10 * full_df["mcda_score_100"],
+        0.50 * full_df["mlp_risk_score_100"] + 0.50 * full_df["logreg_risk_score_100"],
     ).round(2)
 
     # Với các đoạn cầu/hầm (score_eligible == False), đánh dấu rõ cấu trúc loại trừ
@@ -88,7 +160,7 @@ def score_entire_study_area(
     ).fillna(True)
     full_df["risk_percentile"] = np.nan
     full_df.loc[eligible_mask, "risk_percentile"] = (
-        full_df.loc[eligible_mask, "mlp_risk_score_100"].rank(pct=True) * 100.0
+        full_df.loc[eligible_mask, "hybrid_risk_score_100"].rank(pct=True) * 100.0
     ).round(2)
 
     pct = full_df["risk_percentile"]
@@ -115,7 +187,7 @@ def score_entire_study_area(
     )
 
     full_df = full_df.sort_values(
-        ["score_eligible", "mlp_risk_score_100", "hybrid_risk_score_100"],
+        ["score_eligible", "hybrid_risk_score_100", "mlp_risk_score_100"],
         ascending=[False, False, False],
         kind="stable",
     ).reset_index(drop=True)
@@ -134,14 +206,71 @@ def score_entire_study_area(
         csv_top1000, index=False, encoding="utf-8-sig"
     )
 
-    # Xuất GeoJSON chuẩn Web GIS (WGS84 - EPSG:4326) ghép điểm nguy cơ với tọa độ đường
+    # Xuất bản đồ tĩnh full_study_area_risk_map.png (đã căn chỉnh suptitle chống chồng chữ) & GeoJSON
     if roads_gdf is not None:
+        aoi_gpkg = interim_dir / "study_area.gpkg"
+        aoi_gdf = gpd.read_file(aoi_gpkg) if aoi_gpkg.is_file() else None
+        map_gdf = roads_gdf[["road_segment_id", "geometry"]].merge(
+            full_df[
+                [
+                    "road_segment_id",
+                    "mlp_risk_score_100",
+                    "hybrid_risk_score_100",
+                    "risk_tier",
+                    "score_eligible",
+                ]
+            ],
+            on="road_segment_id",
+            how="inner",
+        )
+        map_gdf = map_gdf[map_gdf["score_eligible"].fillna(True)]
+        fig, axes = plt.subplots(1, 2, figsize=(18, 9.5))
+        for ax, col_plot, title_str in (
+            (
+                axes[0],
+                "mlp_risk_score_100",
+                "1. Bản đồ Điểm Nguy cơ Ngập AI — Deep MLP (0–100)",
+            ),
+            (
+                axes[1],
+                "hybrid_risk_score_100",
+                "2. Bản đồ Điểm Nguy cơ Ngập Tổng hợp — Tri-Model Ensemble (MLP + LogReg Local + MCDA)",
+            ),
+        ):
+            if aoi_gdf is not None:
+                aoi_gdf.boundary.plot(ax=ax, color="#172b4d", linewidth=1.2)
+            map_gdf.plot(
+                ax=ax,
+                column=col_plot,
+                cmap="RdYlBu_r",
+                linewidth=0.35,
+                legend=True,
+                legend_kwds={"label": "Chỉ số Nguy cơ Ngập (0 – 100)", "shrink": 0.72},
+            )
+            ax.set_title(title_str, fontweight="bold", fontsize=11.5, pad=12)
+            ax.set_axis_off()
+        fig.suptitle(
+            f"Bản đồ Phân bố Nguy cơ Ngập lụt trên Toàn bộ {len(full_df):,} Đoạn đường TP.HCM",
+            fontsize=14,
+            fontweight="bold",
+            y=0.98,
+        )
+        fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+        fig.savefig(
+            output_dir / "full_study_area_risk_map.png",
+            dpi=160,
+            bbox_inches="tight",
+            facecolor="white",
+        )
+        plt.close(fig)
+
         export_cols = [
             "road_segment_id",
             "road_name",
             "highway_type",
             "length_m",
             "mlp_risk_score_100",
+            "logreg_risk_score_100",
             "mcda_score_100",
             "hybrid_risk_score_100",
             "risk_percentile",
@@ -149,6 +278,8 @@ def score_entire_study_area(
             "risk_tier",
             "elevation_median_m",
             "relative_elevation_m",
+            "block_rel_elev_z",
+            "local_pocket_index",
             "dist_water_m",
             "builtup_ratio_250m",
             "score_eligible",

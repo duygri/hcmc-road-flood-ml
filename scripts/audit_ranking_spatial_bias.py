@@ -12,6 +12,8 @@ from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+from flood_ml.inference import compute_local_basin_features
+
 FEATURE_COLS = [
     "elevation_median_m",
     "elevation_p10_m",
@@ -91,14 +93,30 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
         subset=["score", "flood_susceptibility_prob", "length_m", *feat_cols]
     ).reset_index(drop=True)
 
-    # Huấn luyện mô hình tuyến tính ít tham số (Regularized L2 Logistic Regression)
-    # trên tập Reference để đối chiếu Ablation với Deep MLP (chống Overfitting cỡ mẫu nhỏ)
-    ref_df = eval_df[eval_df["partition"] == "reference"]
-    if (ref_df["label"] == 1.0).sum() < 10:
-        ref_df = eval_df
+    # Bổ sung đặc trưng địa hình cục bộ theo ô lưới 5km×5km (block_rel_elev_z, local_pocket_index)
+    eval_df = compute_local_basin_features(eval_df)
+    local_feat_cols = [*feat_cols, "block_rel_elev_z", "local_pocket_index"]
+
+    # Lấy mẫu Presence-Background (1:3) trên tập Reference để huấn luyện Logistic Regression
+    rng = np.random.default_rng(42)
+    ref_raw = eval_df[eval_df["partition"] == "reference"]
+    if (ref_raw["label"] == 1.0).sum() < 10:
+        ref_raw = eval_df
+    pos_sub = ref_raw[ref_raw["label"] == 1.0]
+    bg_sub = ref_raw[ref_raw["label"] == 0.0]
+    if len(pos_sub) > 0 and len(bg_sub) > 0:
+        n_bg = min(len(bg_sub), len(pos_sub) * 3)
+        ref_df = pd.concat(
+            [pos_sub, bg_sub.iloc[rng.choice(len(bg_sub), size=n_bg, replace=False)]],
+            ignore_index=True,
+        ).sample(frac=1.0, random_state=42)
+    else:
+        ref_df = ref_raw
+
+    y_ref = ref_df["label"].to_numpy(dtype=np.int32)
+
     scaler_lr = StandardScaler()
     x_ref = scaler_lr.fit_transform(ref_df[feat_cols].to_numpy(dtype=np.float32))
-    y_ref = ref_df["label"].to_numpy(dtype=np.int32)
     clf_lr = LogisticRegression(
         C=0.25, class_weight="balanced", max_iter=500, random_state=42
     )
@@ -106,9 +124,25 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
     x_all_lr = scaler_lr.transform(eval_df[feat_cols].to_numpy(dtype=np.float32))
     eval_df["logreg_prob"] = clf_lr.predict_proba(x_all_lr)[:, 1]
 
+    scaler_lr_local = StandardScaler()
+    x_ref_local = scaler_lr_local.fit_transform(
+        ref_df[local_feat_cols].to_numpy(dtype=np.float32)
+    )
+    clf_lr_local = LogisticRegression(
+        C=0.25, class_weight="balanced", max_iter=500, random_state=42
+    )
+    clf_lr_local.fit(x_ref_local, y_ref)
+    x_all_lr_local = scaler_lr_local.transform(
+        eval_df[local_feat_cols].to_numpy(dtype=np.float32)
+    )
+    eval_df["logreg_local_prob"] = clf_lr_local.predict_proba(x_all_lr_local)[:, 1]
+
     eval_df["elev_risk_score"] = -eval_df["elevation_median_m"]
-    eval_df["hybrid_score"] = 0.5 * eval_df["flood_susceptibility_prob"] + 0.5 * (
-        eval_df["score"] / 100.0
+    # Tri-Model Ensemble: 45% Deep MLP + 45% LogReg Local-Basin + 10% MCDA
+    eval_df["hybrid_score"] = (
+        0.45 * eval_df["flood_susceptibility_prob"]
+        + 0.45 * eval_df["logreg_local_prob"]
+        + 0.10 * (eval_df["score"] / 100.0)
     )
 
     holdout_df = eval_df[eval_df["partition"] == "holdout"].copy()
@@ -120,13 +154,13 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
         holdout_df.loc[holdout_df["label"] == 1.0, "length_m"].sum()
     )
 
-    # 1. Risk Ranking Accuracy trên dữ liệu Positive-Unlabeled (PU):
-    # Ưu tiên Capture@K% và Lift@K% theo chiều dài đường làm thước đo chính.
+    # 1. Risk Ranking Accuracy trên dữ liệu Positive-Unlabeled (PU)
     top_k_budgets = (0.01, 0.05, 0.10, 0.20)
     methods = (
+        ("Tri-Model Ensemble (MLP + LogReg Local + MCDA)", "hybrid_score"),
+        ("Logistic Regression + Local Basin (L2 - 11 tham số)", "logreg_local_prob"),
         ("Deep MLP (Nonlinear Ablation)", "flood_susceptibility_prob"),
         ("Logistic Regression (L2 - 9 tham số)", "logreg_prob"),
-        ("Hybrid Ensemble (MLP + MCDA)", "hybrid_score"),
         ("Baseline MCDA (Địa vật lý)", "score"),
         ("Elevation-Only (Độ cao thuần)", "elev_risk_score"),
     )
@@ -160,7 +194,7 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
         n_pos = int((grp["label"] == 1.0).sum())
         if n_roads < 30:
             continue
-        rho, _ = spearmanr(grp["flood_susceptibility_prob"], grp["score"])
+        rho, _ = spearmanr(grp["hybrid_score"], grp["score"])
         grp_total_len = max(float(grp["length_m"].sum()), 1e-6)
         grp_flood_len = max(
             float(grp.loc[grp["label"] == 1.0, "length_m"].sum()), 1e-6
@@ -187,11 +221,13 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
             act_f = float(sub_b["length_m"].sum()) / grp_total_len
             return cap_r, cap_r / max(act_f, 1e-6)
 
+        ens_cap10, ens_lift10 = _block_capture(grp, "hybrid_score", 0.10)
+        ens_cap20, _ = _block_capture(grp, "hybrid_score", 0.20)
         mlp_cap10, mlp_lift10 = _block_capture(
             grp, "flood_susceptibility_prob", 0.10
         )
         mlp_cap20, _ = _block_capture(grp, "flood_susceptibility_prob", 0.20)
-        lr_cap10, _ = _block_capture(grp, "logreg_prob", 0.10)
+        lr_cap10, _ = _block_capture(grp, "logreg_local_prob", 0.10)
         mcda_cap10, _ = _block_capture(grp, "score", 0.10)
 
         block_rows.append(
@@ -199,6 +235,15 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
                 "block_id": block_id,
                 "Số đoạn đường": n_roads,
                 "Số đoạn ngập": n_pos,
+                "Ensemble Capture@10%": (
+                    round(ens_cap10, 4) if np.isfinite(ens_cap10) else None
+                ),
+                "Ensemble Lift@10%": (
+                    round(ens_lift10, 2) if np.isfinite(ens_lift10) else None
+                ),
+                "Ensemble Capture@20%": (
+                    round(ens_cap20, 4) if np.isfinite(ens_cap20) else None
+                ),
                 "MLP Capture@10%": (
                     round(mlp_cap10, 4) if np.isfinite(mlp_cap10) else None
                 ),
@@ -240,12 +285,14 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
     bias_rows = []
     overall_pos_rate = float(eval_df["label"].mean())
     q90_mlp = float(eval_df["flood_susceptibility_prob"].quantile(0.90))
+    q90_ens = float(eval_df["hybrid_score"].quantile(0.90))
     q90_mcda = float(eval_df["score"].quantile(0.90))
     for r_group, grp in eval_df.groupby("road_group"):
         if len(grp) < 50:
             continue
         obs_rate = float(grp["label"].mean())
         mlp_top10_rate = float((grp["flood_susceptibility_prob"] >= q90_mlp).mean())
+        ens_top10_rate = float((grp["hybrid_score"] >= q90_ens).mean())
         mcda_top10_rate = float((grp["score"] >= q90_mcda).mean())
         bias_rows.append(
             {
@@ -258,8 +305,12 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
                 "Điểm MLP TB": round(
                     float(grp["flood_susceptibility_prob"].mean()), 4
                 ),
+                "Điểm Ensemble TB": round(float(grp["hybrid_score"].mean()), 4),
                 "Điểm MCDA TB (0-100)": round(float(grp["score"].mean()), 2),
                 "Tỷ lệ vào Top-10% Nguy cơ (MLP %)": round(mlp_top10_rate * 100, 2),
+                "Tỷ lệ vào Top-10% Nguy cơ (Ensemble %)": round(
+                    ens_top10_rate * 100, 2
+                ),
                 "Tỷ lệ vào Top-10% Nguy cơ (MCDA %)": round(mcda_top10_rate * 100, 2),
             }
         )
@@ -274,9 +325,10 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
                 "đo chính."
             ),
             "model_capacity_ablation": (
-                "Deep MLP được trình bày như một thí nghiệm thăm dò tính phi tuyến "
-                "(Nonlinear Ablation Study) đặt cạnh Logistic Regression chuẩn hóa L2 "
-                "(9 tham số) và Baseline MCDA địa vật lý."
+                "Tri-Model Ensemble (45% Deep MLP + 45% Logistic Regression Local-Basin "
+                "+ 10% MCDA) kết hợp tính phi tuyến của Deep MLP ở Top 1-10% với khả "
+                "năng tổng quát hóa và đặc trưng túi ngập cục bộ theo ô lưới 5km×5km "
+                "(block_rel_elev_z, local_pocket_index) của Logistic Regression L2."
             ),
         },
         "risk_ranking_accuracy_holdout": ranking_rows,

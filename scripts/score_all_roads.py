@@ -119,15 +119,18 @@ def score_entire_study_area(
         ascending=[False, False, False],
         kind="stable",
     ).reset_index(drop=True)
+    eligible_sorted = full_df.get(
+        "score_eligible", pd.Series(True, index=full_df.index)
+    ).fillna(True)
     full_df["risk_rank"] = np.where(
-        eligible_mask, np.arange(1, len(full_df) + 1), np.nan
+        eligible_sorted, np.arange(1, len(full_df) + 1), np.nan
     )
 
     # Lưu bảng Parquet đầy đủ và CSV Top 1.000 đoạn đường nguy cơ cao nhất
     parquet_out = output_dir / "full_study_area_road_risk_scores.parquet"
     csv_top1000 = output_dir / "top_1000_highest_risk_roads.csv"
     full_df.to_parquet(parquet_out, index=False)
-    full_df.loc[eligible_mask].head(1000).to_csv(
+    full_df.loc[eligible_sorted].head(1000).to_csv(
         csv_top1000, index=False, encoding="utf-8-sig"
     )
 

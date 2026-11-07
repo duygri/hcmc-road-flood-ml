@@ -90,3 +90,15 @@ def test_colab_notebook_prioritizes_pu_capture_lift_and_ablation():
     assert "LogisticRegression" in source
     assert "full_study_area_road_risk_scores.parquet" in source
     assert "from getpass import getpass" in source
+
+
+def test_colab_notebook_bootstraps_missing_or_corrupt_drive_source():
+    doc = _notebook()
+    cell = next(
+        c for c in doc["cells"] if c.get("id") == "8dd0d8092fe74a7c96281538738b07e2"
+    )
+    source = "".join(cell.get("source", []))
+    assert "_is_valid_source_dir" in source
+    assert "tomllib.loads" in source
+    assert "archive/refs/heads/main.zip" in source
+    assert "importlib.invalidate_caches()" in source

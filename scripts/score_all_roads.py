@@ -12,7 +12,11 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from flood_ml.inference import FloodSusceptibilityPredictor, compute_local_basin_features
+from flood_ml.inference import (
+    FloodSusceptibilityPredictor,
+    compute_local_basin_features,
+    fit_local_basin_stats,
+)
 
 FEATURE_COLS = [
     "elevation_median_m",
@@ -40,15 +44,22 @@ def score_entire_study_area(
     df_mcda = pd.read_parquet(processed_dir / "road_susceptibility.parquet")
 
     # Ghép phân vùng không gian trước khi tính đặc trưng cục bộ theo ô lưới (block_id)
-    merged_in = df_feat.merge(
+    merged_in = df_feat.drop(
+        columns=[c for c in ("partition", "block_id") if c in df_feat.columns]
+    ).merge(
         df_part[["road_segment_id", "partition", "block_id"]],
         on="road_segment_id",
         how="left",
     )
 
     # Dự đoán xác suất ngập từ mô hình Deep MLP cho toàn bộ 100% đoạn đường trong AOI
-    scored = predictor.predict_dataframe(merged_in)
-    scored = compute_local_basin_features(scored)
+    ref_in = merged_in[merged_in["partition"] == "reference"]
+    basin_stats = predictor.basin_stats or fit_local_basin_stats(
+        ref_in if len(ref_in) > 0 else merged_in
+    )
+    predictor.basin_stats = basin_stats
+    scored = compute_local_basin_features(merged_in, basin_stats=basin_stats)
+    scored = predictor.predict_dataframe(scored)
 
     # Ghép điểm MCDA vật lý
     full_df = scored.merge(
@@ -100,7 +111,7 @@ def score_entire_study_area(
             & full_df.get("score_eligible", pd.Series(True, index=full_df.index)).fillna(True)
         )
         ref_pool = full_df.loc[valid_lr & (full_df["partition"] == "reference")]
-        if (ref_pool["_label"] == 1).sum() < 10:
+        if (ref_pool["_label"] == 1).sum() == 0 or (ref_pool["_label"] == 0).sum() == 0:
             ref_pool = full_df.loc[valid_lr]
         pos_sub = ref_pool[ref_pool["_label"] == 1]
         bg_sub = ref_pool[ref_pool["_label"] == 0]
@@ -166,7 +177,7 @@ def score_entire_study_area(
     pct = full_df["risk_percentile"]
     full_df["risk_tier"] = np.where(
         ~eligible_mask,
-        "Cầu/Hầm (Loại trừ cấu trúc)",
+        "7. Cầu/Hầm (Loại trừ cấu trúc)",
         np.where(
             pct >= 99.0,
             "1. Nguy kịch (Top 1%)",

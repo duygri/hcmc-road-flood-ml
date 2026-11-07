@@ -12,7 +12,7 @@ from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from flood_ml.inference import compute_local_basin_features
+from flood_ml.inference import compute_local_basin_features, fit_local_basin_stats
 
 FEATURE_COLS = [
     "elevation_median_m",
@@ -49,7 +49,9 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
                 valid_matches = close_matches
         pos_ids = set(valid_matches["road_segment_id"].unique())
 
-    base_eval = df_feat.merge(
+    base_eval = df_feat.drop(
+        columns=[c for c in ("partition", "block_id") if c in df_feat.columns]
+    ).merge(
         df_part[["road_segment_id", "partition", "block_id"]],
         on="road_segment_id",
         how="inner",
@@ -94,14 +96,19 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
     ).reset_index(drop=True)
 
     # Bổ sung đặc trưng địa hình cục bộ theo ô lưới 5km×5km (block_rel_elev_z, local_pocket_index)
-    eval_df = compute_local_basin_features(eval_df)
+    # Khớp phân vị tham chiếu (basin_stats) chỉ trên tập Reference để chống rò rỉ sang Holdout
+    ref_seed_df = eval_df[eval_df["partition"] == "reference"]
+    basin_stats = fit_local_basin_stats(ref_seed_df if len(ref_seed_df) > 0 else eval_df)
+    eval_df = compute_local_basin_features(eval_df, basin_stats=basin_stats)
     local_feat_cols = [*feat_cols, "block_rel_elev_z", "local_pocket_index"]
 
     # Lấy mẫu Presence-Background (1:3) trên tập Reference để huấn luyện Logistic Regression
     rng = np.random.default_rng(42)
     ref_raw = eval_df[eval_df["partition"] == "reference"]
-    if (ref_raw["label"] == 1.0).sum() < 10:
+    partition_isolation_strict = True
+    if (ref_raw["label"] == 1.0).sum() == 0 or (ref_raw["label"] == 0.0).sum() == 0:
         ref_raw = eval_df
+        partition_isolation_strict = False
     pos_sub = ref_raw[ref_raw["label"] == 1.0]
     bg_sub = ref_raw[ref_raw["label"] == 0.0]
     if len(pos_sub) > 0 and len(bg_sub) > 0:
@@ -146,8 +153,10 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
     )
 
     holdout_df = eval_df[eval_df["partition"] == "holdout"].copy()
-    if (holdout_df["label"] == 1.0).sum() < 5:
+    holdout_fallback_used = False
+    if (holdout_df["label"] == 1.0).sum() == 0:
         holdout_df = eval_df.copy()
+        holdout_fallback_used = True
 
     total_holdout_len_m = float(holdout_df["length_m"].sum())
     flooded_holdout_len_m = float(
@@ -188,47 +197,73 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
         ranking_rows.append(row_item)
 
     # 2. Spatial Validation across 5km x 5km blocks
+    def _block_capture(
+        df_block: pd.DataFrame,
+        score_col: str,
+        n_pos_blk: int,
+        grp_total_len: float,
+        grp_flood_len: float,
+        budget_f: float = 0.10,
+    ) -> tuple[float, float]:
+        if n_pos_blk == 0:
+            return np.nan, np.nan
+        ord_b = df_block.sort_values(
+            [score_col, "road_segment_id"], ascending=[False, True], kind="stable"
+        )
+        c_len = ord_b["length_m"].cumsum().to_numpy()
+        idx_cut = min(
+            int(np.searchsorted(c_len, budget_f * grp_total_len, side="left")) + 1,
+            len(ord_b),
+        )
+        sub_b = ord_b.iloc[:idx_cut]
+        cap_r = (
+            float(sub_b.loc[sub_b["label"] == 1.0, "length_m"].sum())
+            / grp_flood_len
+        )
+        act_f = float(sub_b["length_m"].sum()) / grp_total_len
+        return cap_r, cap_r / max(act_f, 1e-6)
+
     block_rows = []
     for block_id, grp in holdout_df.groupby("block_id", sort=True):
         n_roads = len(grp)
         n_pos = int((grp["label"] == 1.0).sum())
         if n_roads < 30:
             continue
-        rho, _ = spearmanr(grp["hybrid_score"], grp["score"])
+        rho_mlp, _ = spearmanr(grp["flood_susceptibility_prob"], grp["score"])
+        rho_ens, _ = spearmanr(grp["hybrid_score"], grp["score"])
         grp_total_len = max(float(grp["length_m"].sum()), 1e-6)
         grp_flood_len = max(
             float(grp.loc[grp["label"] == 1.0, "length_m"].sum()), 1e-6
         )
 
-        def _block_capture(
-            df_block: pd.DataFrame, score_col: str, budget_f: float = 0.10
-        ) -> tuple[float, float]:
-            if n_pos == 0:
-                return np.nan, np.nan
-            ord_b = df_block.sort_values(
-                [score_col, "road_segment_id"], ascending=[False, True], kind="stable"
-            )
-            c_len = ord_b["length_m"].cumsum().to_numpy()
-            idx_cut = min(
-                int(np.searchsorted(c_len, budget_f * grp_total_len, side="left")) + 1,
-                len(ord_b),
-            )
-            sub_b = ord_b.iloc[:idx_cut]
-            cap_r = (
-                float(sub_b.loc[sub_b["label"] == 1.0, "length_m"].sum())
-                / grp_flood_len
-            )
-            act_f = float(sub_b["length_m"].sum()) / grp_total_len
-            return cap_r, cap_r / max(act_f, 1e-6)
-
-        ens_cap10, ens_lift10 = _block_capture(grp, "hybrid_score", 0.10)
-        ens_cap20, _ = _block_capture(grp, "hybrid_score", 0.20)
-        mlp_cap10, mlp_lift10 = _block_capture(
-            grp, "flood_susceptibility_prob", 0.10
+        ens_cap10, ens_lift10 = _block_capture(
+            grp, "hybrid_score", n_pos, grp_total_len, grp_flood_len, 0.10
         )
-        mlp_cap20, _ = _block_capture(grp, "flood_susceptibility_prob", 0.20)
-        lr_cap10, _ = _block_capture(grp, "logreg_local_prob", 0.10)
-        mcda_cap10, _ = _block_capture(grp, "score", 0.10)
+        ens_cap20, _ = _block_capture(
+            grp, "hybrid_score", n_pos, grp_total_len, grp_flood_len, 0.20
+        )
+        mlp_cap10, mlp_lift10 = _block_capture(
+            grp,
+            "flood_susceptibility_prob",
+            n_pos,
+            grp_total_len,
+            grp_flood_len,
+            0.10,
+        )
+        mlp_cap20, _ = _block_capture(
+            grp,
+            "flood_susceptibility_prob",
+            n_pos,
+            grp_total_len,
+            grp_flood_len,
+            0.20,
+        )
+        lr_cap10, _ = _block_capture(
+            grp, "logreg_local_prob", n_pos, grp_total_len, grp_flood_len, 0.10
+        )
+        mcda_cap10, _ = _block_capture(
+            grp, "score", n_pos, grp_total_len, grp_flood_len, 0.10
+        )
 
         block_rows.append(
             {
@@ -260,7 +295,10 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
                     round(mcda_cap10, 4) if np.isfinite(mcda_cap10) else None
                 ),
                 "Tương quan Spearman (MLP vs MCDA)": (
-                    round(float(rho), 4) if np.isfinite(rho) else None
+                    round(float(rho_mlp), 4) if np.isfinite(rho_mlp) else None
+                ),
+                "Tương quan Spearman (Ensemble vs MCDA)": (
+                    round(float(rho_ens), 4) if np.isfinite(rho_ens) else None
                 ),
             }
         )
@@ -330,6 +368,10 @@ def run_audit(processed_dir: Path, run_out_dir: Path, run_id: str) -> dict:
                 "năng tổng quát hóa và đặc trưng túi ngập cục bộ theo ô lưới 5km×5km "
                 "(block_rel_elev_z, local_pocket_index) của Logistic Regression L2."
             ),
+            "partition_isolation": {
+                "strict_reference_only_training": partition_isolation_strict,
+                "holdout_fallback_used": holdout_fallback_used,
+            },
         },
         "risk_ranking_accuracy_holdout": ranking_rows,
         "spatial_validation_by_block": block_rows,

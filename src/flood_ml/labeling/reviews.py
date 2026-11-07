@@ -90,7 +90,7 @@ def _table(frame, columns, keys):
             if isinstance(value, (bool, np.bool_)):
                 return bool(value)
             if isinstance(value, str):
-                normalized = value.strip().casefold()
+                normalized = value.strip()
                 if normalized in ("true", "false", ""):
                     return normalized == "true"
             raise PipelineError(
